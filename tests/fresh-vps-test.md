@@ -12,7 +12,9 @@ uname -r
 modprobe ppp_generic && ls -l /dev/ppp
 ```
 `VERSION_ID="13"`; the `modprobe` must succeed. If the kernel ends in
-`-cloud-amd64` and has no PPP, the installer must refuse (see test 2).
+`-cloud-amd64` and has no PPP, the installer must offer the kernel fix
+and wait for an exact `YES` (see test 2b). Use a throwaway server for
+that test: the cloud kernel is removed and the server reboots.
 
 ## 1. Fresh install
 ```bash
@@ -31,10 +33,40 @@ command -v vpn-panel || echo "old name gone"
 
 ## 2. Refusal tests (nothing may change)
 - Non-Debian / Debian 12: installer exits with "tested on Debian 13 only".
-- Kernel without PPP: installer exits with the PPP message **before**
-  `systemctl stop` — check `systemctl is-active xl2tpd` is unchanged.
+- Kernel without PPP that is *not* a `-cloud-amd64` kernel: installer
+  exits with the PPP message **before** `systemctl stop` — check
+  `systemctl is-active xl2tpd` is unchanged.
 - Another process on UDP 1701 (`nc -u -l 1701`): installer refuses and
   services are untouched.
+
+## 2b. Cloud kernel without PPP: the kernel fix
+Only on a throwaway VPS whose `uname -r` ends in `-cloud-amd64` and where
+`modprobe ppp_generic` fails. **First** check the provider console works
+and take a snapshot.
+```bash
+sudo -i bash ./install.sh      # run it from an interactive SSH session
+```
+1. The red warning appears first, before anything is installed. It says
+   this **cannot be undone**, the cloud kernel will be removed, SSH is
+   lost if the stock kernel does not boot, check console access and take
+   a snapshot. Nothing has changed yet.
+2. Cancel test: answer `y`, then `yes`, then just Enter, each time on a
+   fresh run. Every one must print `Cancelled. Nothing was changed.`
+   Check `uname -r` and `dpkg -l 'linux-image-*cloud*'` are unchanged
+   and `/var/lib/easyl2tp/kernel-fix` does not exist.
+3. Real run: answer exactly `YES`. It installs `linux-image-amd64`,
+   removes the cloud kernel, runs `update-grub`, prints the instruction
+   to re-run the installer, counts `5 4 3 2 1`, and reboots.
+4. Log in again (use the console if SSH does not come back and report
+   what you see). `uname -r` must **not** end in `-cloud-amd64`, and
+   `modprobe ppp_generic && ls -l /dev/ppp` must work.
+5. Run `sudo -i bash ./install.sh` again. It must print
+   `PPP kernel support: OK`, continue straight into the normal install
+   (no second warning, no second reboot) and end with "Ready".
+   `/var/lib/easyl2tp/kernel-fix` must be gone afterwards.
+6. If the server comes back on a cloud kernel anyway, the re-run must
+   stop with `this VPS cannot run L2TP` and must **not** offer the fix
+   or reboot again. Report the provider and image name.
 
 ## 3. Re-run is safe
 ```bash
@@ -56,6 +88,21 @@ Use `ezl2tp card test-user1` and connect:
 
 For each: internet works (`curl ifconfig.me` shows the server IP) and
 `ezl2tp users` shows it ONLINE, then offline with traffic counted afterwards.
+
+**Live traffic** (check this for the IKEv2 phone and the L2TP phone/modem):
+while the client is connected and downloading something,
+```bash
+l2tp-user stats ; ezl2tp users ; ezl2tp status
+```
+- `l2tp-user stats` and `ezl2tp users` both show `ONLINE: IKEv2(10.99.1.x)`
+  or `ONLINE: L2TP(pppN)` for that user, and never `offline`.
+- Upload/download grow between two runs a few seconds apart, and the
+  `ezl2tp users` numbers match `l2tp-user stats`. `ezl2tp status` total
+  traffic includes them too.
+- Note the user's TOTAL, disconnect the client, wait a few seconds, and
+  run `l2tp-user stats` again: the user is `offline` and the TOTAL is
+  about the same as just before (a little more is fine; roughly double is
+  a bug — report it).
 If a client that worked before now fails right at the IKE step, check
 `journalctl -u strongswan-starter | grep -i aggressive` — that client uses
 IKEv1 aggressive mode (see PR description for what to do).

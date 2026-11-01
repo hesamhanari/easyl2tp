@@ -6,6 +6,7 @@
 set -u
 
 PANEL="${1:-./ezl2tp}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -16,8 +17,26 @@ printf '* * test-tun-pass\n' > "$TMP/l2tp-secrets"
 printf 'test-ali 1000000 5000000\ntest-sara 200000 300000\n' > "$TMP/totals.db"
 printf 'test-ali 10.99.0.10\n' > "$TMP/sessions/ppp0"
 printf '2026-01-01 10:00:00 | CONNECT | L2TP(ppp0) | test-ali | Session started\n' > "$TMP/sessions.log"
-printf '#!/bin/bash\necho "STUB l2tp-user $@"\n' > "$TMP/l2tp-user-stub"
+# An OLD l2tp-user (no "usage" command, no easyl2tp-api marker). It logs every
+# call, because an old copy would take an unknown word like "usage" for a new
+# username and add it.
+cat > "$TMP/l2tp-user-stub" <<STUB
+#!/bin/bash
+echo "\$*" >> "$TMP/l2tp-user-calls"
+echo "STUB l2tp-user \$@"
+STUB
 chmod +x "$TMP/l2tp-user-stub"
+: > "$TMP/l2tp-user-calls"
+# A NEW l2tp-user: carries the marker and answers "usage" with live rows.
+cat > "$TMP/l2tp-user-new" <<STUB
+#!/bin/bash
+# easyl2tp-api: usage-v1
+if [ "\${1:-}" = usage ]; then
+  echo "test-ali 7000000 8000000 IKEv2(10.99.1.10)"
+  echo "test-sara 0 0 -"
+fi
+STUB
+chmod +x "$TMP/l2tp-user-new"
 
 export EZL2TP_CHAP="$TMP/chap-secrets"
 export EZL2TP_IPSEC_SECRETS="$TMP/ipsec.secrets"
@@ -90,10 +109,39 @@ fi
 check "users: ali totals" "$USERS" "5.72 MB"
 check "stats delegates to l2tp-user" "$(ezl2tp stats)" "STUB l2tp-user stats"
 
+# Old l2tp-user: the panel falls back to saved totals + session files and must
+# never send it "usage" (it would be added as a user).
+ezl2tp status >/dev/null 2>&1; ezl2tp users >/dev/null 2>&1
+if grep -qx 'usage' "$TMP/l2tp-user-calls"; then
+  echo "FAIL: panel sent 'usage' to an l2tp-user without the easyl2tp-api marker"; fail=1
+else
+  echo "ok: panel does not send 'usage' to an old l2tp-user"
+fi
+
+# New l2tp-user: the panel shows its live rows (totals + live), not the saved totals.
+NEWUSERS="$(EZL2TP_L2TP_USER="$TMP/l2tp-user-new" ezl2tp users)"
+check "live rows: ali upload 7000000 B" "$NEWUSERS" "6.68 MB"
+check "live rows: ali download 8000000 B" "$NEWUSERS" "7.63 MB"
+check "live rows: ali ONLINE" "$(printf '%s\n' "$NEWUSERS" | grep 'test-ali')" "ONLINE"
+check "live rows: sara offline" "$(printf '%s\n' "$NEWUSERS" | grep 'test-sara')" "offline"
+check "live rows: status counts online users" "$(EZL2TP_L2TP_USER="$TMP/l2tp-user-new" ezl2tp status)" "Users:           2 total, 1 online"
+check "live rows: status total traffic includes live bytes" "$(EZL2TP_L2TP_USER="$TMP/l2tp-user-new" ezl2tp status)" "upload 6.68 MB, download 7.63 MB"
+
 if ezl2tp card no-such-user >/dev/null 2>&1; then
   echo "FAIL: missing user should exit non-zero"; fail=1
 else
   echo "ok: missing user exits non-zero"
 fi
+
+# The other suites: the kernel auto-fix and live traffic / online status.
+# They run the real code from install.sh, so a green smoke test covers them.
+for t in kernel-fix-test.sh live-stats-test.sh; do
+  echo "--- $t"
+  if bash "$HERE/$t" "$PANEL"; then
+    echo "ok: $t"
+  else
+    echo "FAIL: $t"; fail=1
+  fi
+done
 
 exit "$fail"

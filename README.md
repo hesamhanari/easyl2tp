@@ -18,7 +18,8 @@ before using it for a real user, and before any public release.
 - A bash panel, `ezl2tp`, with an interactive menu and one-shot
   commands:
   - status (kernel, PPP device, services, ports, users online)
-  - users (online/offline, upload/download/total)
+  - users (online/offline, upload/download/total — including the
+    traffic of sessions that are still connected, not only finished ones)
   - live sessions, session logs, bandwidth stats
   - add/delete a user, show one user's connection card
   - restart the VPN services
@@ -49,10 +50,10 @@ checkout, or copy `install.sh` to the server and run it there.
 What the installer does, in order:
 1. Checks root, Debian 13 (other versions are refused) and a public IPv4.
 2. Checks PPP kernel support FIRST (modules load and `/dev/ppp` opens),
-   before stopping anything.
-   If PPP is disabled in the kernel (some Debian cloud kernels),
-   it stops with a clear message instead of installing a broken
-   server. Fix that kernel first, then re-run.
+   before installing or stopping anything. Most servers pass and the
+   install just continues. If PPP is disabled in the kernel (Debian
+   cloud kernels, `...-cloud-amd64`), see "Cloud kernel without PPP"
+   below — the installer can fix it, but only if you say so.
 3. Generates the master IPsec PSK and modem tunnel password
    with `openssl rand` — unless you pass `TUNPW` / `IPSEC_PSK`
    in the environment to rotate them on purpose, or unless a
@@ -69,6 +70,43 @@ What the installer does, in order:
 Re-running the installer is safe for users: it reuses existing
 secrets and preserves existing users in chap-secrets.
 
+### Cloud kernel without PPP (extra steps)
+
+Some VPS images boot a Debian *cloud* kernel that has PPP compiled out.
+L2TP cannot work on it, and no package or `modprobe` can change that.
+On such a server the installer stops at step 2 and offers to swap in the
+stock Debian kernel:
+
+1. It prints a warning in red capitals: **this cannot be undone**, the
+   cloud kernel will be removed, and if the stock kernel fails to boot
+   you will lose SSH. Before you go on, check that your provider gives
+   you console access (VNC / serial / rescue) and, on a real server,
+   take a snapshot.
+2. It does nothing until you type exactly `YES` (capitals; `y` and `yes`
+   cancel, and nothing is changed).
+3. After `YES` it installs `linux-image-amd64`, checks that the new
+   kernel is really there and has PPP, removes the cloud kernel, runs
+   `update-grub`, then reboots with a 5-4-3-2-1 countdown. If any of
+   those steps fails, it stops *before* the reboot and says what to fix.
+4. Your SSH session ends with the reboot. Wait about a minute, log in
+   again, and **run the same installer command again**. PPP now passes
+   and the real install starts.
+
+If the server comes back on a cloud kernel anyway (the provider boots
+its own kernel and ignores `/boot`), the installer stops with
+`this VPS cannot run L2TP` and does not try again — use a different VPS
+image or plan. The installer asks for the terminal, so run it from an
+interactive SSH session, not piped into `bash`.
+
+### Traffic numbers are live
+
+`ezl2tp users`, `ezl2tp status` and `l2tp-user stats` all show the
+saved totals **plus** what connected users are using right now (ppp
+interface counters for L2TP, firewall counters per user address for
+IKEv2). Online status comes from the live session files, so a connected
+user is never shown as offline. When a user disconnects, their final
+bytes move into the saved totals — nothing is counted twice.
+
 ## Current files
 
 - `install.sh` — the one-line installer above.
@@ -82,7 +120,13 @@ secrets and preserves existing users in chap-secrets.
 - `SPEC.md` — the build plan for Claude, in PR order.
 - `AGENTS.md` — the multi-agent workflow for this project.
 - `SECURITY.md` — what must never go into this repo.
-- `tests/smoke-test.sh` — fake-data smoke test for the panel.
+- `tests/smoke-test.sh` — fake-data smoke test for the panel; also runs
+  the two suites below.
+- `tests/kernel-fix-test.sh` — the cloud-kernel auto-fix, run against
+  stubbed apt/grub/reboot (the exact-`YES` rule, the order of steps,
+  the no-loop rule after the reboot).
+- `tests/live-stats-test.sh` — live traffic and online status for
+  `l2tp-user` and the panel, including the IKEv2 regression.
 - `tests/lint.sh` — shellcheck (including the scripts embedded in
   `install.sh`) and guards for settings that must not come back.
 - `tests/fresh-vps-test.md` — how to test the installer on a fresh
