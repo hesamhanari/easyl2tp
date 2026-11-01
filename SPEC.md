@@ -32,7 +32,16 @@ below is green.
   live session files; check users/live/card/status output).
 - LICENSE (MIT, to confirm) and SECURITY.md.
 
-## PR 1 — Claude: repo skeleton + cleaned installer (do this first)
+## PR 1 — installer (status: built by Rio 2026-11-01, needs review + fresh-VPS test)
+`install.sh` in this repo is already built from the tested Gemini
+script, with random secret generation, a PPP check before any
+destructive step, backups, and reuse of existing secrets on
+re-install. Claude's PR 1 job is now REVIEW + TEST, not a rewrite
+from scratch, unless the review finds a reason to rewrite:
+review the installer against the acceptance criteria below,
+fix what fails, and test it on a fresh Debian 13 VPS.
+
+Original PR 1 acceptance criteria (still apply):
 Acceptance criteria:
 - No hardcoded passwords, PSKs, tunnel passwords, server IPs, or
   usernames anywhere in the repo, docs, or tests. Secrets are

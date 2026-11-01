@@ -4,9 +4,11 @@ A simple L2TP + IKEv2 VPN server with a terminal panel for managing
 users, live sessions, and bandwidth usage — built for people who are
 new to running their own VPS.
 
-**Status: private work in progress. Do not publish yet, and do not
-run this on a production server as an installer — there is no
-`install.sh` in this repo yet. That is PR 1 in SPEC.md.**
+**Status: private work in progress. Do not publish yet.**
+`install.sh` now exists in this repo, built from the tested
+Gemini script with random secret generation (see below). It has
+not yet been tested on a fresh VPS — test it on a spare server
+before using it for a real user, and before any public release.
 
 ## What this will be
 
@@ -31,8 +33,43 @@ run this on a production server as an installer — there is no
 - Not a PPTP server. PPTP is deliberately not offered: its
   encryption is broken.
 
+## Install (Debian 13, root, fresh VPS recommended)
+
+One-line installer, like 3x-ui / backpack installers:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hesamhanari/easyl2tp/main/install.sh)
+```
+
+While this repo is private, that raw URL needs GitHub auth and
+will not work anonymously. Until it goes public, clone the repo
+(private, needs GitHub auth) and run `./install.sh` from the
+checkout, or copy `install.sh` to the server and run it there.
+
+What the installer does, in order:
+1. Checks root and Debian 13.
+2. Checks PPP kernel support FIRST, before stopping anything.
+   If PPP is disabled in the kernel (some Debian cloud kernels),
+   it stops with a clear message instead of installing a broken
+   server. Fix that kernel first, then re-run.
+3. Generates the master IPsec PSK and modem tunnel password
+   with `openssl rand` — unless you pass `TUNPW` / `IPSEC_PSK`
+   in the environment to rotate them on purpose, or unless a
+   previous install already has them, in which case it reuses
+   them so existing users keep working.
+4. Backs up any existing configs to `/root/easyl2tp-backup-*`.
+5. Installs strongswan-starter (L2TP/IPsec IKEv1 + IKEv2),
+   xl2tpd, firewall/NAT, usage tracking, `l2tp-user`, and
+   `vpn-panel` if it can find it.
+6. Prints the server IP and the two secrets at the end, on the
+   server terminal only. Save them — do not share them publicly.
+
+Re-running the installer is safe for users: it reuses existing
+secrets and preserves existing users in chap-secrets.
+
 ## Current files
 
+- `install.sh` — the one-line installer above.
 - `vpn-panel` — the panel script. Works on top of an already
   installed L2TP/IKEv2 server that uses:
   - `/etc/ppp/chap-secrets` for users
