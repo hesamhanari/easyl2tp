@@ -49,6 +49,9 @@
 #   firewall/NAT via /usr/local/sbin/l2tp-fw.sh + l2tp-firewall.service
 #   usage tracking: /var/log/vpn-usage/*, /usr/local/sbin/vpn-acct-update
 #   admin CLI: /usr/local/bin/l2tp-user
+#   data limits: ezl2tp limit <user> <GB|clear>, stored in
+#     /var/lib/easyl2tp/limits.db, enforced by the connect hooks and by
+#     easyl2tp-limits.timer (every 30 seconds)
 #   panel: /usr/local/bin/ezl2tp (if it can be found next to
 #     this script or fetched from the repo; non-fatal if missing)
 #
@@ -298,6 +301,9 @@ kernel_fix() {
   echo "AFTER THE REBOOT: wait about a minute, log in by SSH again, and RE-RUN THIS"
   echo "INSTALLER (the same command you used to start it)."
   echo
+  # Must stay the LAST line printed before the countdown: the SSH session dies
+  # on the reboot, and this is the line the user is still looking at.
+  kfix_red "IMPORTANT: AFTER THE REBOOT, START THE SCRIPT AGAIN: bash ./install.sh"
   i=5
   while [ "$i" -ge 1 ]; do
     echo "Rebooting in $i..."
@@ -498,6 +504,13 @@ mkdir -p /var/log/vpn-usage /run/vpn-sessions
 touch /var/log/vpn-usage/totals.db /var/log/vpn-usage/sessions.log
 chmod 600 /var/log/vpn-usage/totals.db /var/log/vpn-usage/sessions.log
 
+# Per-user data limits live in their OWN file, not in totals.db, so resetting
+# usage never erases a limit. touch (not >) keeps limits across a re-install.
+mkdir -p /var/lib/easyl2tp
+chmod 700 /var/lib/easyl2tp
+touch /var/lib/easyl2tp/limits.db
+chmod 600 /var/lib/easyl2tp/limits.db
+
 cat > /usr/local/sbin/vpn-acct-update <<'ACCT'
 #!/bin/bash
 USR="${1:-unknown}"
@@ -583,6 +596,19 @@ CONF
 mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
 cat > /etc/ppp/ip-up.d/99-l2tp-rpfilter <<'PPPFW'
 #!/bin/bash
+USR=$(echo "${PEERNAME:-unknown}" | tr -d '"')
+
+# Data limit: refuse a user who is at or over their limit by ending this
+# session before anything is set up for it. "l2tp-user gate" exits 3 for
+# "blocked"; every other result (no limit, error, command missing) lets the
+# session in, so a broken limit check can never lock everybody out.
+GATE=0
+/usr/local/bin/l2tp-user gate "$USR" "L2TP($1)" >/dev/null 2>&1 || GATE=$?
+if [ "$GATE" -eq 3 ]; then
+  if [ -n "${PPPD_PID:-}" ]; then kill "$PPPD_PID" 2>/dev/null; fi
+  exit 1
+fi
+
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 for f in /proc/sys/net/ipv4/conf/*/rp_filter; do
   echo 0 > "$f" 2>/dev/null || true
@@ -593,7 +619,6 @@ ip rule add to 10.99.0.0/24 lookup main priority 10 2>/dev/null || true
 ip route flush table 220 2>/dev/null || true
 
 mkdir -p /run/vpn-sessions
-USR=$(echo "${PEERNAME:-unknown}" | tr -d '"')
 echo "$USR ${5:-unknown}" > "/run/vpn-sessions/$1"
 /usr/local/sbin/vpn-acct-update "$USR" 0 0 "L2TP($1)" "CONNECT"
 PPPFW
@@ -621,6 +646,19 @@ VIP="${PLUTO_PEER_SOURCEIP:-${PLUTO_PEER_CLIENT%/*}}"
 case "${PLUTO_VERB:-}" in
   up-client|up-host)
     if [ -n "$VIP" ] && [ "$VIP" != "0.0.0.0" ]; then
+      # Data limit (see ip-up): 3 = blocked, anything else lets the session in.
+      GATE=0
+      /usr/local/bin/l2tp-user gate "$USR" "IKEv2($VIP)" >/dev/null 2>&1 || GATE=$?
+      if [ "$GATE" -eq 3 ] && [ -n "${PLUTO_UNIQUEID:-}" ]; then
+        # Refuse: end exactly this IKE SA. "ipsec down" cannot run inside this
+        # hook (it would wait for the SA this hook is still part of), so it is
+        # detached and started a second later. Without a unique id we would
+        # have to end every SA of the connection, so in that case the session
+        # is registered as usual and the 30-second limit check ends it.
+        # shellcheck disable=SC2016
+        setsid sh -c 'sleep 1; exec ipsec down "$1"' sh "${PLUTO_CONNECTION:-ikev2-psk}[${PLUTO_UNIQUEID}]" >/dev/null 2>&1 </dev/null &
+        exit 0
+      fi
       mkdir -p /run/vpn-sessions
       echo "$USR $VIP" > "/run/vpn-sessions/ikev2_${VIP}"
       while iptables -D FORWARD -s "$VIP" -m comment --comment "IKEV2_UP_${USR}" -j ACCEPT 2>/dev/null; do :; done
@@ -864,27 +902,53 @@ ExecStop=/usr/local/sbin/l2tp-fw.sh down
 WantedBy=multi-user.target
 UNIT
 
+cat > /etc/systemd/system/easyl2tp-limits.service <<'UNIT'
+[Unit]
+Description=easyl2tp data limits: disconnect users who are over their limit
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/l2tp-user enforce
+UNIT
+
+cat > /etc/systemd/system/easyl2tp-limits.timer <<'UNIT'
+[Unit]
+Description=Run the easyl2tp data limit check every 30 seconds
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+UNIT
+
 cat > /usr/local/bin/l2tp-user <<'USER_SCRIPT'
 #!/bin/bash
 # easyl2tp-api: usage-v1
-# ezl2tp looks for the line above before it runs "l2tp-user usage". A copy
-# of l2tp-user without it would take "usage" for a new username.
+# easyl2tp-api: limits-v1
+# ezl2tp looks for the lines above before it runs "l2tp-user usage" or
+# "l2tp-user limit(s)". A copy of l2tp-user without them would take those
+# words for a new username.
 set -eu
 
 ACT="${1:-list}"
 USR="${2:-}"
 PAS="${3:-}"
 
-if [ -n "$ACT" ] && [ "$ACT" != "add" ] && [ "$ACT" != "del" ] && [ "$ACT" != "list" ] && [ "$ACT" != "stats" ] && [ "$ACT" != "reset" ] && [ "$ACT" != "logs" ] && [ "$ACT" != "usage" ]; then
-  PAS="${2:-}"
-  USR="$ACT"
-  ACT="add"
+if [ -n "$ACT" ]; then
+  case "$ACT" in
+    add | del | list | stats | reset | logs | usage | limit | limits | gate | enforce) ;;
+    *)
+      PAS="${2:-}"
+      USR="$ACT"
+      ACT="add"
+      ;;
+  esac
 fi
 
 # Names and passwords end up in chap-secrets, ipsec.secrets and sed
 # patterns, so only a safe alphabet is accepted. Checked before anything
 # else runs, so a bad name changes nothing.
-if [ "$ACT" = "add" ] || [ "$ACT" = "del" ] || { [ "$ACT" = "reset" ] && [ -n "$USR" ]; }; then
+if [ "$ACT" = "add" ] || [ "$ACT" = "del" ] || [ "$ACT" = "limit" ] || { [ "$ACT" = "reset" ] && [ -n "$USR" ]; }; then
   if ! printf '%s' "$USR" | grep -Eq '^[A-Za-z0-9._-]{1,32}$'; then
     echo "Invalid username: use 1-32 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)." >&2
     exit 1
@@ -903,6 +967,15 @@ CHAP="/etc/ppp/chap-secrets"
 SESS_DIR="/run/vpn-sessions"
 NET_DIR="/sys/class/net"
 DB="/var/log/vpn-usage/totals.db"
+LOG="/var/log/vpn-usage/sessions.log"
+LOCK="/var/log/vpn-usage/.lock"
+RUN_DIR="/run"
+# Data limits: <user> <limit_bytes> <period_start_epoch>, one line per limited
+# user. A separate file from totals.db on purpose: "reset" empties totals.db
+# and must never erase a limit. Period start 0 = not started yet (it starts at
+# the user's first connection after the limit was set).
+LIMITS_DB="/var/lib/easyl2tp/limits.db"
+PERIOD_SECS=2592000 # 30 days
 touch "$DB"
 
 SERVER_IP=""
@@ -979,26 +1052,31 @@ usage_rows() {
 
   # S = IKEv2 child SAs as strongSwan reports them. The user is the id in
   # brackets after the "..." on the ESTABLISHED line; bytes_i = from the client.
-  ipsec statusall 2>/dev/null | gawk '
-    /ikev2-psk\[[0-9]+\]: ESTABLISHED/ {
-      cur_user = ""
-      if (match($0, /\.\.\.[^ ]+\[([^\]]+)\]/, m)) {
-        cur_user = m[1]
-        gsub(/"/, "", cur_user)
+  # Not from the connect hooks (SKIP_STATUSALL=1): asking charon for its status
+  # from inside the hook of an SA that is still being set up would wait for
+  # that very SA. The iptables counters below cover IKEv2 there.
+  if [ "${SKIP_STATUSALL:-0}" != 1 ]; then
+    ipsec statusall 2>/dev/null | gawk '
+      /ikev2-psk\[[0-9]+\]: ESTABLISHED/ {
+        cur_user = ""
+        if (match($0, /\.\.\.[^ ]+\[([^\]]+)\]/, m)) {
+          cur_user = m[1]
+          gsub(/"/, "", cur_user)
+        }
       }
-    }
-    /ikev2-psk\{[0-9]+\}:.*bytes_i/ {
-      rx = 0; tx = 0
-      if (match($0, /([0-9]+) bytes_i/, bi)) rx = bi[1]
-      if (match($0, /([0-9]+) bytes_o/, bo)) tx = bo[1]
-    }
-    /ikev2-psk\{[0-9]+\}:.*=== 10\.99\.1\./ {
-      if (match($0, /=== (10\.99\.1\.[0-9]+)/, vip)) {
-        print "S", vip[1], (cur_user != "" ? cur_user : "-"), rx + 0, tx + 0
+      /ikev2-psk\{[0-9]+\}:.*bytes_i/ {
         rx = 0; tx = 0
+        if (match($0, /([0-9]+) bytes_i/, bi)) rx = bi[1]
+        if (match($0, /([0-9]+) bytes_o/, bo)) tx = bo[1]
       }
-    }
-  ' >> "$facts" || true
+      /ikev2-psk\{[0-9]+\}:.*=== 10\.99\.1\./ {
+        if (match($0, /=== (10\.99\.1\.[0-9]+)/, vip)) {
+          print "S", vip[1], (cur_user != "" ? cur_user : "-"), rx + 0, tx + 0
+          rx = 0; tx = 0
+        }
+      }
+    ' >> "$facts" || true
+  fi
 
   # I = iptables FORWARD counters per VIP (IKEV2_UP_* = from the client,
   # IKEV2_DOWN_* = to the client). They keep counting across IKEv2 child SA
@@ -1081,6 +1159,260 @@ show_stats() {
   echo "--------------------------------------------------------------------------------"
 }
 
+# ---- Data limits -----------------------------------------------------------
+# One limit per user, counted as upload + download together, from the same
+# rows as "usage" (totals.db + the live counters of open sessions), so stats,
+# the panel, the connect hooks and the limit check can never disagree.
+#
+# Period: rolling 30 days PER USER. It starts at the user's first connection
+# after the limit was set (not on the 1st of a month). When it has run out, the
+# user's NEXT connection resets their totals to zero and starts a new period,
+# with no admin action. A manual "reset" restarts the period from now.
+#
+# Enforcement is a block: "gate" (connect hooks) refuses a user at or over the
+# limit, and "enforce" (systemd timer, every 30 seconds) disconnects the live
+# sessions of such a user. A user with no limit is never touched.
+
+# Run a function while holding the usage lock (the one vpn-acct-update uses),
+# so totals.db and limits.db change together and never between a hook's read
+# and write. A function run this way must not call with_lock again.
+with_lock() {
+  ( flock -x 200; "$@" ) 200>"$LOCK"
+}
+
+log_event() { # log_event <EVENT> <label> <user> <note>
+  printf "%s | %-10s | %-8s | %-15s | %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "$3" "$4" >> "$LOG" 2>/dev/null || true
+}
+
+limit_get() { # prints "<limit_bytes> <period_start>" or nothing
+  [ -f "$LIMITS_DB" ] || return 0
+  awk -v u="$1" '$1 == u && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { print $2, $3; exit }' "$LIMITS_DB"
+}
+
+limit_put() { # limit_put <user> <limit_bytes> <period_start>  (add or replace)
+  mkdir -p "$(dirname "$LIMITS_DB")"
+  touch "$LIMITS_DB"
+  awk -v u="$1" -v l="$2" -v s="$3" '
+    $1 == u { if (!done) print u, l, s; done = 1; next }
+    { print }
+    END { if (!done) print u, l, s }
+  ' "$LIMITS_DB" > "$LIMITS_DB.tmp" && mv "$LIMITS_DB.tmp" "$LIMITS_DB"
+  chmod 600 "$LIMITS_DB"
+}
+
+limit_del() { # limit_del <user>
+  [ -f "$LIMITS_DB" ] || return 0
+  awk -v u="$1" '$1 != u' "$LIMITS_DB" > "$LIMITS_DB.tmp" && mv "$LIMITS_DB.tmp" "$LIMITS_DB"
+  chmod 600 "$LIMITS_DB"
+}
+
+totals_zero() { # totals_zero <user>: used bytes of finished sessions back to 0
+  awk -v u="$1" '$1 != u' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+  chmod 600 "$DB"
+}
+
+# One row per limited user:
+#   <user> <limit_bytes> <used_bytes> <period_start> <period_end> <state> <sessions>
+#   used  = upload + download (totals.db + live counters, from usage_rows)
+#   state = pending  period not started (starts at the next connection)
+#           ok       inside the period, under the limit
+#           BLOCKED  inside the period, at or over the limit
+#           expired  period over; the next connection resets and starts a new one
+#   start/end are epoch seconds, 0 while pending.
+limit_rows() {
+  [ -s "$LIMITS_DB" ] || return 0
+  usage_rows | awk -v now="$(date +%s)" -v period="$PERIOD_SECS" -v limits="$LIMITS_DB" '
+    BEGIN {
+      while ((getline line < limits) > 0) {
+        if (split(line, f, " ") >= 3 && f[1] != "" && f[2] ~ /^[0-9]+$/ && f[3] ~ /^[0-9]+$/) { lim[f[1]] = f[2]; st[f[1]] = f[3] }
+      }
+    }
+    { used[$1] = $2 + $3; sess[$1] = $4 }
+    END {
+      for (u in lim) {
+        s = st[u] + 0; e = 0; state = "pending"
+        if (s != 0) {
+          e = s + period
+          if (now + 0 >= e) state = "expired"
+          else if (used[u] + 0 >= lim[u] + 0) state = "BLOCKED"
+          else state = "ok"
+        }
+        printf "%s %.0f %.0f %.0f %.0f %s %s\n", u, lim[u], used[u], s, e, state, (u in sess ? sess[u] : "-")
+      }
+    }
+  ' | LC_ALL=C sort
+}
+
+# Runs under with_lock. Exit status 3 = this user must be refused.
+gate_locked() { # gate_locked <user> <label>
+  local user="$1" label="$2" rec lim start now used
+  rec=$(limit_get "$user")
+  [ -n "$rec" ] || return 0
+  read -r lim start <<EOF2
+$rec
+EOF2
+  now=$(date +%s)
+  if [ "$start" -eq 0 ] || [ "$now" -ge $((start + PERIOD_SECS)) ]; then
+    # First connection since the limit was set, or the period has run out:
+    # fresh totals, new period, nothing for the admin to do.
+    totals_zero "$user"
+    limit_put "$user" "$lim" "$now"
+    log_event PERIOD "$label" "$user" "New data-limit period started"
+  fi
+  used=$(SKIP_STATUSALL=1 usage_rows | awk -v u="$user" '$1 == u { printf "%.0f", $2 + $3; exit }')
+  if awk -v u="${used:-0}" -v l="$lim" 'BEGIN { exit !(u + 0 >= l + 0) }'; then
+    log_event BLOCKED "$label" "$user" "Refused: data limit reached"
+    return 3
+  fi
+  return 0
+}
+
+# Called by the connect hooks. 0 = let in, 3 = refuse. Anything that goes
+# wrong exits with another code, which the hooks treat as "let in".
+gate_cmd() { # gate_cmd <user> [label]
+  local user="${1:-}" label="${2:-VPN}" rc=0
+  [ -n "$user" ] || return 0
+  # Fast path for everyone without a limit: no lock, no usage rows.
+  [ -n "$(limit_get "$user")" ] || return 0
+  with_lock gate_locked "$user" "$label" || rc=$?
+  return "$rc"
+}
+
+kill_ppp() { # kill_ppp <pppN>: end one L2TP session by stopping its pppd
+  local pidfile="$RUN_DIR/$1.pid" pid=""
+  [ -r "$pidfile" ] || return 1
+  read -r pid < "$pidfile" || true
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  # Only ever signal a real pppd (a stale pid file could name anything).
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "pppd" ] || return 1
+  kill "$pid" 2>/dev/null
+}
+
+# End every live session of one user. $3 = the "ipsec statusall" text, read
+# once by the caller. The ip-down / updown hooks then do the normal clean-up
+# and add the final bytes to totals.db.
+disconnect_user() { # disconnect_user <user> <sessions> <statusall text>
+  local user="$1" sessions="$2" sa="$3" s dev id
+  for s in $(printf '%s' "$sessions" | tr ',' ' '); do
+    case "$s" in
+      "L2TP(ppp"*)
+        dev="${s#L2TP(}"
+        dev="${dev%)}"
+        if kill_ppp "$dev"; then log_event BLOCKED "$s" "$user" "Disconnected: data limit reached"; fi
+        ;;
+    esac
+  done
+  case "$sessions" in
+    *"IKEv2("*)
+      for id in $(printf '%s\n' "$sa" | gawk -v u="$user" '
+        match($0, /ikev2-psk\[([0-9]+)\]: ESTABLISHED/, a) {
+          cur = ""; cid = a[1]
+          if (match($0, /\.\.\.[^ ]+\[([^\]]+)\]/, m)) { cur = m[1]; gsub(/"/, "", cur) }
+          if (cur == u) print cid
+        }'); do
+        if ipsec down "ikev2-psk[$id]" >/dev/null 2>&1; then
+          log_event BLOCKED "IKEv2(sa $id)" "$user" "Disconnected: data limit reached"
+        fi
+      done
+      ;;
+  esac
+}
+
+# Timer entry point: disconnect the live sessions of every user whose period
+# has started and who is at or over the limit. Cheap when nobody has a limit.
+enforce_cmd() {
+  local rows user lim used start sessions over="" sa=""
+  [ -s "$LIMITS_DB" ] || return 0
+  rows=$(limit_rows)
+  while read -r user lim used start _ _ sessions; do
+    [ -n "$user" ] || continue
+    [ "$start" != "0" ] && [ "$sessions" != "-" ] || continue
+    awk -v u="$used" -v l="$lim" 'BEGIN { exit !(u + 0 >= l + 0) }' || continue
+    over="$over$user $sessions
+"
+  done <<EOF2
+$rows
+EOF2
+  [ -n "$over" ] || return 0
+  sa=$(ipsec statusall 2>/dev/null || true)
+  while read -r user sessions; do
+    [ -n "$user" ] || continue
+    disconnect_user "$user" "$sessions" "$sa"
+  done <<EOF2
+$over
+EOF2
+}
+
+user_exists() {
+  awk -v u="$1" '!/^#/ && NF >= 3 { x = $1; gsub(/"/, "", x); if (x == u) f = 1 } END { exit !f }' "$CHAP" 2>/dev/null
+}
+
+fmt_gb() { awk -v b="$1" 'BEGIN { printf "%.2f GB", b / 1073741824 }'; }
+
+limit_set_locked() { # limit_set_locked <user> <bytes>
+  local rec start=0
+  rec=$(limit_get "$1")
+  if [ -n "$rec" ]; then start="${rec#* }"; fi
+  limit_put "$1" "$2" "$start"
+}
+
+limit_cmd() { # limit_cmd <user> <GB | clear>
+  local user="$1" val="$2" bytes rec start online
+  if [ -z "$user" ] || [ -z "$val" ]; then
+    echo "Usage: l2tp-user limit <user> <GB>     (decimals allowed: 50 or 12.5)" >&2
+    echo "       l2tp-user limit <user> clear   (unlimited)" >&2
+    exit 1
+  fi
+  if [ "$val" = "clear" ]; then
+    rec=$(limit_get "$user")
+    with_lock limit_del "$user"
+    if [ -n "$rec" ]; then echo "Limit removed for $user: unlimited."; else echo "$user had no limit: unlimited."; fi
+    return 0
+  fi
+  if ! printf '%s' "$val" | grep -Eq '^[0-9]{1,7}(\.[0-9]{1,6})?$'; then
+    echo "Invalid limit '$val': give a number of GB such as 50 or 12.5, or the word clear." >&2
+    exit 1
+  fi
+  bytes=$(awk -v g="$val" 'BEGIN { printf "%.0f", g * 1073741824 }')
+  if [ "$bytes" -le 0 ]; then
+    echo "Invalid limit '$val': it must be greater than 0 (use 'clear' for unlimited)." >&2
+    exit 1
+  fi
+  if ! user_exists "$user"; then
+    echo "User '$user' not found in $CHAP." >&2
+    exit 1
+  fi
+  rec=$(limit_get "$user")
+  with_lock limit_set_locked "$user" "$bytes"
+  start="${rec#* }"
+  if [ -z "$rec" ] || [ "$start" = "0" ]; then
+    echo "Limit for $user set to $(fmt_gb "$bytes") per 30-day period (upload + download)."
+    echo "The period starts at $user's first connection from now on."
+    online=$(usage_rows | awk -v u="$user" '$1 == u && $4 != "-" { print "yes"; exit }')
+    if [ -n "$online" ]; then
+      echo "NOTE: $user is connected right now. Their period still starts at their next"
+      echo "connection. To start it now, run: l2tp-user reset $user"
+    fi
+  else
+    echo "Limit for $user changed to $(fmt_gb "$bytes"). The running period is unchanged."
+  fi
+}
+
+reset_locked() { # reset_locked <user|"">
+  local now
+  now=$(date +%s)
+  if [ -n "$1" ]; then
+    totals_zero "$1"
+    if [ -n "$(limit_get "$1")" ]; then limit_put "$1" "$(limit_get "$1" | cut -d' ' -f1)" "$now"; fi
+  else
+    : > "$DB"
+    if [ -s "$LIMITS_DB" ]; then
+      awk -v n="$now" '$2 ~ /^[0-9]+$/ { print $1, $2, n }' "$LIMITS_DB" > "$LIMITS_DB.tmp" && mv "$LIMITS_DB.tmp" "$LIMITS_DB"
+      chmod 600 "$LIMITS_DB"
+    fi
+  fi
+}
+
 if [ "$ACT" = "add" ]; then
   if [ -z "$USR" ]; then
     echo "Usage: l2tp-user <username> [password]"
@@ -1106,15 +1438,26 @@ elif [ "$ACT" = "del" ]; then
   sed -i "/^\"*$USR\"*[[:space:]]/d" /etc/ppp/chap-secrets /etc/ppp/pap-secrets
   rebuild_ipsec_secrets
   ipsec rereadsecrets >/dev/null 2>&1 || true
+  with_lock limit_del "$USR"
   echo "Removed user: $USR"
 elif [ "$ACT" = "reset" ]; then
+  # Usage goes back to zero; a data limit is kept, and its period restarts now.
+  with_lock reset_locked "$USR"
   if [ -n "$USR" ]; then
-    sed -i "/^$USR /d" "$DB"
     echo "Reset bandwidth usage for user: $USR"
+    if [ -n "$(limit_get "$USR")" ]; then echo "Their data-limit period restarted from now (the limit itself is unchanged)."; fi
   else
-    : > "$DB"
     echo "Reset bandwidth usage for ALL users."
+    if [ -s "$LIMITS_DB" ]; then echo "Every data-limit period restarted from now (the limits themselves are unchanged)."; fi
   fi
+elif [ "$ACT" = "limit" ]; then
+  limit_cmd "$USR" "$PAS"
+elif [ "$ACT" = "limits" ]; then
+  limit_rows
+elif [ "$ACT" = "gate" ]; then
+  gate_cmd "$USR" "$PAS"
+elif [ "$ACT" = "enforce" ]; then
+  enforce_cmd
 elif [ "$ACT" = "logs" ]; then
   if [ ! -s /var/log/vpn-usage/sessions.log ]; then
     echo "No session events recorded yet."
@@ -1130,6 +1473,7 @@ else
   echo "Server IP: $SERVER_IP   (secrets are shown only on a user card: ezl2tp card <user>)"
   show_stats
   echo "Commands: l2tp-user add <user> <pass> | l2tp-user stats | l2tp-user reset [user] | l2tp-user logs"
+  echo "          l2tp-user limit <user> <GB|clear>"
 fi
 USER_SCRIPT
 chmod +x /usr/local/bin/l2tp-user
@@ -1160,10 +1504,11 @@ systemctl daemon-reload
 systemctl disable --now strongswan strongswan-swanctl 2>/dev/null || true
 systemctl enable --now strongswan-starter xl2tpd l2tp-firewall
 systemctl restart strongswan-starter xl2tpd l2tp-firewall
+systemctl enable --now easyl2tp-limits.timer
 
 # Fail loudly if a service did not come up, instead of printing "Ready".
 FAILED=""
-for s in strongswan-starter xl2tpd l2tp-firewall; do
+for s in strongswan-starter xl2tpd l2tp-firewall easyl2tp-limits.timer; do
   systemctl is-active --quiet "$s" || FAILED="$FAILED $s"
 done
 if [ -n "$FAILED" ]; then
@@ -1176,7 +1521,7 @@ echo "=================================================="
 echo "easyl2tp VPN Server Ready on $SERVER_IP"
 echo "=================================================="
 echo "Kernel:    $(uname -r)"
-echo "Services:  strongswan-starter, xl2tpd, l2tp-firewall (all active)"
+echo "Services:  strongswan-starter, xl2tpd, l2tp-firewall, easyl2tp-limits.timer (all active)"
 echo "Backups:   $BACKUP_DIR"
 echo "--------------------------------------------------"
 echo "Secrets were generated or reused and are stored only on this"
@@ -1189,4 +1534,5 @@ echo "  1. Add a user:        ezl2tp add <username>"
 echo "  2. Show their card:   ezl2tp card <username>"
 echo "     (a card holds that user's secrets - share it only with them)"
 echo "  3. Open the panel:    ezl2tp"
+echo "  4. Optional data cap: ezl2tp limit <username> <GB>   (ezl2tp limit <username> clear = unlimited)"
 echo "=================================================="

@@ -133,9 +133,10 @@ else
   echo "ok: missing user exits non-zero"
 fi
 
-# The other suites: the kernel auto-fix and live traffic / online status.
-# They run the real code from install.sh, so a green smoke test covers them.
-for t in kernel-fix-test.sh live-stats-test.sh; do
+# The other suites: the kernel auto-fix, live traffic / online status and
+# per-user data limits. They run the real code from install.sh, so a green
+# smoke test covers them.
+for t in kernel-fix-test.sh live-stats-test.sh limits-test.sh; do
   echo "--- $t"
   if bash "$HERE/$t" "$PANEL"; then
     echo "ok: $t"

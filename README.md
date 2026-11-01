@@ -22,6 +22,7 @@ before using it for a real user, and before any public release.
     traffic of sessions that are still connected, not only finished ones)
   - live sessions, session logs, bandwidth stats
   - add/delete a user, show one user's connection card
+  - per-user data limits (`ezl2tp limit <user> <GB>`), see "Data limits"
   - restart the VPN services
 - Usage tracking per user, so an admin can see who used how much.
 
@@ -88,9 +89,11 @@ stock Debian kernel:
    kernel is really there and has PPP, removes the cloud kernel, runs
    `update-grub`, then reboots with a 5-4-3-2-1 countdown. If any of
    those steps fails, it stops *before* the reboot and says what to fix.
-4. Your SSH session ends with the reboot. Wait about a minute, log in
-   again, and **run the same installer command again**. PPP now passes
-   and the real install starts.
+4. Your SSH session ends with the reboot. The last line before the
+   countdown is `IMPORTANT: AFTER THE REBOOT, START THE SCRIPT AGAIN:
+   bash ./install.sh`, so it is the thing still on your screen when the
+   connection drops. Wait about a minute, log in again, and **run the
+   installer again**. PPP now passes and the real install starts.
 
 If the server comes back on a cloud kernel anyway (the provider boots
 its own kernel and ignores `/boot`), the installer stops with
@@ -107,6 +110,67 @@ IKEv2). Online status comes from the live session files, so a connected
 user is never shown as offline. When a user disconnects, their final
 bytes move into the saved totals — nothing is counted twice.
 
+## Data limits
+
+Cap how much a user can transfer per 30 days. Upload and download count
+together.
+
+```bash
+ezl2tp limit test-user1 50       # 50 GB per 30 days
+ezl2tp limit test-user1 12.5     # decimals are fine
+ezl2tp limit test-user1 clear    # unlimited again
+```
+
+(`l2tp-user limit <user> <GB|clear>` does the same; the panel just calls
+it, so the two always agree. GB here means 1024 x 1024 x 1024 bytes, the
+same GB the panel prints.) The menu has the same thing under
+"Set or clear a user's data limit".
+
+**What counts.** The same numbers as `ezl2tp users`: the saved totals plus
+what connected sessions are using right now. A disconnect moves the live
+bytes into the saved totals, so nothing is counted twice. A user is over
+the limit when used is **at or above** the limit.
+
+**The period** is per user and rolling, 30 days, and it starts at that
+user's **first connection after the limit was set** (not on the 1st of a
+month). Two users with the same limit have different period ends. When the
+period has run out, that user's **next connection resets their totals to
+zero and starts a new period** by itself, with no admin action. Totals are
+a per-period quota while a limit is set, so they also start from zero at
+that first connection (older history is not counted against the new quota;
+write it down first if you need it).
+
+**Enforcement is a block**, for both L2TP/ppp and IKEv2:
+
+- A user who is at or over the limit is **refused**: the new session is
+  ended within about a second, before it is registered or counted.
+- A user who goes over while connected is **disconnected**. A systemd timer
+  (`easyl2tp-limits.timer`) checks every 30 seconds, so a user can overshoot
+  by up to 30 seconds of traffic. This is a cap, not billing-grade metering.
+- The user stays blocked until their period ends; then the next connection
+  starts a fresh period. A limit is also lifted at once by raising it or
+  with `ezl2tp limit <user> clear`.
+- A user with no limit is **never** blocked.
+
+**Manual reset.** `l2tp-user reset <user>` sets that user's usage to zero and
+restarts their period from now. The limit itself is kept (`l2tp-user reset`
+with no user does this for everybody). Use it to unblock a user early, and
+to start the period at once for an always-on modem that was already
+connected when you set the limit (otherwise its period starts at its next
+connection).
+
+**What you see.** `ezl2tp users` shows a LIMIT column (`unlimited` when none)
+and, under each limited user, used, left and the period end date. A user over
+the limit shows `BLOCKED` in the STATUS column. `ezl2tp card <user>` has the
+same information: limit, used, remaining, period end, and OK or BLOCKED.
+Dates are UTC.
+
+**Where it is stored.** `/var/lib/easyl2tp/limits.db` (root only), a
+separate file from `totals.db`, so resetting usage never erases a limit and a
+re-install keeps them. Deleting a user removes their limit. An older server
+needs the installer run once more to get this (your users are kept); until
+then `ezl2tp limit` says so instead of doing anything.
+
 ## Current files
 
 - `install.sh` — the one-line installer above.
@@ -115,18 +179,23 @@ bytes move into the saved totals — nothing is counted twice.
   - `/etc/ppp/chap-secrets` for users
   - `/var/log/vpn-usage/totals.db` and `sessions.log` for usage
   - `/run/vpn-sessions/*` for live sessions
-  - `/usr/local/bin/l2tp-user` for add/delete/stats (the panel
+  - `/usr/local/bin/l2tp-user` for add/delete/stats/limits (the panel
     delegates to it, so secret handling stays in one place)
+  - `/var/lib/easyl2tp/limits.db` for per-user data limits
 - `SPEC.md` — the build plan for Claude, in PR order.
 - `AGENTS.md` — the multi-agent workflow for this project.
 - `SECURITY.md` — what must never go into this repo.
 - `tests/smoke-test.sh` — fake-data smoke test for the panel; also runs
-  the two suites below.
+  the three suites below.
 - `tests/kernel-fix-test.sh` — the cloud-kernel auto-fix, run against
   stubbed apt/grub/reboot (the exact-`YES` rule, the order of steps,
   the no-loop rule after the reboot).
 - `tests/live-stats-test.sh` — live traffic and online status for
   `l2tp-user` and the panel, including the IKEv2 regression.
+- `tests/limits-test.sh` — data limits with fake data: set/clear, the
+  30-day period and automatic reset, blocking on both protocols (the real
+  ip-up and IKEv2 hooks), disconnecting live sessions, unlimited users, and
+  what the panel shows.
 - `tests/lint.sh` — shellcheck (including the scripts embedded in
   `install.sh`) and guards for settings that must not come back.
 - `tests/fresh-vps-test.md` — how to test the installer on a fresh
