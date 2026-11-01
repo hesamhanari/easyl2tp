@@ -29,6 +29,7 @@ ls -l /etc/ipsec.secrets /etc/xl2tpd/l2tp-secrets /etc/ppp/chap-secrets   # all 
 ezl2tp add test-user1
 ezl2tp status ; ezl2tp users ; ezl2tp card test-user1
 command -v vpn-panel || echo "old name gone"
+cat /var/lib/easyl2tp/version     # 40 hex characters (the commit), or "unknown" if not from a clean checkout
 ```
 
 ## 2. Refusal tests (nothing may change)
@@ -78,6 +79,7 @@ sudo bash ./install.sh
 diff <(grep '^: PSK' /root/ipsec.before) <(grep '^: PSK' /etc/ipsec.secrets) && echo "PSK reused"
 ezl2tp users            # test-user1 still there
 ls /root/easyl2tp-backup-*
+cat /var/lib/easyl2tp/version
 ```
 
 ## 4. Real clients (the part only a person can test)
@@ -146,11 +148,14 @@ Needs the user from test 1 and a client you can connect and disconnect
    one with no limit) must stay connected the whole time.
 4. **Confirm the block on both protocols.** Try to connect `test-user1`
    again with the L2TP/IPsec phone or modem **and** with the IKEv2 phone.
-   Each must come up and drop again within a few seconds, `ezl2tp live`
-   must not list it, and the log must say `Refused: data limit reached`
-   for `L2TP(pppN)` and for `IKEv2(...)`. If an IKEv2 session stays up for
-   more than a few seconds before the 30-second check ends it, report it
-   with `journalctl -u strongswan-starter | tail -n 50`.
+   The L2TP/ppp one must come up and drop again within a few seconds, and
+   the log must say `Refused: data limit reached` for `L2TP(pppN)` and for
+   `IKEv2(...)`. A BLOCKED user may still **show as connected on IKEv2**
+   (the phone keeps its tunnel up); that is expected. What matters is that
+   **no traffic passes through the VPS**: on the IKEv2 phone, `curl
+   ifconfig.me` or any page must fail or time out while the user is BLOCKED.
+   If traffic does pass, report it with
+   `journalctl -u strongswan-starter | tail -n 50`.
 5. **Unlimited users are never blocked.** `ezl2tp limit test-user1 clear`;
    `ezl2tp users` shows `unlimited`, and the same client now connects and
    stays connected.
@@ -175,4 +180,108 @@ Needs the user from test 1 and a client you can connect and disconnect
 
 Re-running `install.sh` must keep `/var/lib/easyl2tp/limits.db` (check it
 before and after) and leave `easyl2tp-limits.timer` active.
+
+## 7. Panel menus
+Use the users from the earlier tests (or add two fake ones: `ezl2tp add test-user1`,
+`ezl2tp add test-user2`). Connect one of them from a phone so one is online.
+Run `ezl2tp` as root.
+
+1. **Main menu** is exactly these nine lines, with no text after the names:
+   ```
+   1 Status
+   2 User Management
+   3 Live sessions
+   4 Logs
+   5 Restart services
+   6 Backup
+   7 Check For Updates
+   8 Uninstall
+   0 Exit
+   ```
+   The old Users, Bandwidth stats, Add, Delete and Card items are gone. The
+   one-shot commands still work: `ezl2tp status`, `ezl2tp users`,
+   `ezl2tp card test-user1`, `ezl2tp stats`, `ezl2tp live`, `ezl2tp logs`.
+2. **2 User Management** shows `1 Show all users`, `2 Add user`, `0 Back`.
+3. **Show all users**: one numbered table with status, upload, download,
+   total and limit. The connected user's row is **green**, offline rows are
+   **red**. Compare the numbers with `l2tp-user stats` in another terminal: the
+   upload / download / total of every user must be identical. Type a number:
+   the user's menu opens (Show card, Change password, Set / clear data limit,
+   Reset data, Disconnect now, Delete user, Back).
+4. **Per-user actions** on `test-user2` (offline):
+   - *Show card* shows only that user's password.
+   - *Change password* with Enter gives a random password; the old one no
+     longer works, the new card is shown, and `grep -c test-user2
+     /etc/ipsec.secrets` shows the line was rebuilt, not duplicated. If the
+     user has a limit, `cat /var/lib/easyl2tp/limits.db` shows it unchanged.
+   - *Set / clear data limit*: `5`, then `clear`, then `0` (both mean
+     unlimited), then `abc` (refused, nothing changes), then Enter (cancels).
+   - *Reset data* and *Delete user* do nothing unless you type exactly `YES`.
+5. **Disconnect now** on the connected user: their phone drops (L2TP and
+   IKEv2 alike); `ezl2tp live` no longer lists the session. The phone can
+   reconnect straight away (it is not a block).
+6. **Add user**: name `test-user3`, Enter (random password), Enter (limit).
+   `cat /var/lib/easyl2tp/limits.db` shows `test-user3 1073741824 0` (1 GB),
+   the card is printed, and every other user's limit (or lack of one) is
+   exactly as before. Repeat with limit `0`, then `clear`, then `2.5`: the
+   first two add an unlimited user (no limits.db line), the last one 2.5 GB.
+
+## 8. Backup and restore
+Throwaway server only for the restore part.
+1. **6 Backup > 1 Create backup** prints `Backup created: /root/easyl2tp-backup-<timestamp>`
+   and nothing secret. Check:
+   ```bash
+   B=$(ls -d /root/easyl2tp-backup-* | tail -n 1)
+   stat -c '%a %n' "$B"                  # 700
+   find "$B" -type f | sort
+   ```
+   The list must contain `etc/ipsec.conf`, `etc/ipsec.secrets`,
+   `etc/xl2tpd/xl2tpd.conf`, `etc/xl2tpd/l2tp-secrets`, `etc/ppp/chap-secrets`,
+   `etc/ppp/pap-secrets`, `etc/ppp/options.xl2tpd`, `etc/strongswan.conf`,
+   `etc/sysctl.d/99-l2tp.conf`, `usr/local/bin/ezl2tp`, `usr/local/bin/l2tp-user`,
+   `usr/local/sbin/l2tp-fw.sh`, `var/log/vpn-usage/totals.db`,
+   `var/log/vpn-usage/sessions.log` and `var/lib/easyl2tp/limits.db`.
+   `ezl2tp backup` prints only the path.
+2. **2 List backups** lists them numbered (the installer's own
+   `easyl2tp-backup-*` folders are marked "made by the installer").
+3. **Restore**: add `test-user9`, then **3 Restore backup**, pick the backup
+   made above. Answer `no`, `yes`, then Enter: each must print `Cancelled.`
+   and change nothing. Answer exactly `YES`: it prints `Current state saved
+   first: <path>` (a new backup that still contains `test-user9`), restores,
+   and restarts the services. `test-user9` is gone, `ezl2tp status` shows
+   three active services, and a client can still connect.
+
+## 9. Check For Updates
+1. **7 Check For Updates** on a server installed by this version: it shows
+   `Installed version:` (the 40-hex commit) and `Latest on main:`. If equal:
+   `You are up to date.`
+2. **Old install**: `rm /var/lib/easyl2tp/version`, then run it again. It must
+   say `not recorded (installed before version tracking)`, offer the update
+   (`An update may be available`), and not print an error.
+3. **Update**: when an update is available, `no`, `y` and Enter cancel with
+   `Nothing was changed.` and take no backup. Exactly `YES` takes a backup,
+   downloads and runs the installer from `main`, and ends with `Update
+   finished.` Then check that nothing was lost: `ezl2tp users` (same users),
+   `cat /var/lib/easyl2tp/limits.db` (same limits), `cat /var/lib/easyl2tp/version`
+   (now the new commit), and that the master PSK in `/etc/ipsec.secrets` is
+   unchanged (`diff` against the backup the update printed) so existing
+   clients keep working. While the repo is private the GitHub check cannot
+   be read anonymously: the panel must say `could not be read from GitHub`
+   and change nothing.
+
+## 10. Uninstall (last: throwaway server only)
+1. **8 Uninstall**, answer `no`, `yes`, then Enter: each prints `Cancelled.
+   Nothing was changed.` Check `systemctl is-active xl2tpd` is still `active`
+   and `ls /root/easyl2tp-backup-*` shows no new backup.
+2. Answer exactly `YES`: it prints `Backup created: <path>` **before**
+   anything is removed, then stops and disables the four units:
+   ```bash
+   systemctl is-enabled strongswan-starter xl2tpd l2tp-firewall easyl2tp-limits.timer   # all "disabled"
+   systemctl is-active  strongswan-starter xl2tpd l2tp-firewall easyl2tp-limits.timer   # all "inactive"
+   command -v ezl2tp l2tp-user || echo "panel and CLI removed"
+   ls -ld /root/easyl2tp-backup-*          # the backup is still there, mode drwx------
+   ```
+   The panel exits by itself. `/etc/ppp/chap-secrets` is left in place.
+3. To come back: run `install.sh` again, then restore the backup from the
+   panel (test 8) if you want the old users and limits.
 

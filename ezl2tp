@@ -11,6 +11,10 @@
 #   ezl2tp
 #
 # Interactive menu:   ezl2tp
+#   1 Status  2 User Management  3 Live sessions  4 Logs  5 Restart services
+#   6 Backup  7 Check For Updates  8 Uninstall  0 Exit
+#   User Management = Show all users (numbered; pick one for its own menu)
+#   and Add user. Everything per-user lives there.
 # One-shot commands:  ezl2tp status | users | stats | live | logs
 #                     ezl2tp add <user> [password]
 #                     ezl2tp del <user>
@@ -18,11 +22,15 @@
 #                     ezl2tp limit <user> <GB>      (data limit, e.g. 50 or 12.5)
 #                     ezl2tp limit <user> clear     (unlimited)
 #                     ezl2tp restart
+#                     ezl2tp backup | backups | update
 #
 # Data sources (overridable with EZL2TP_* env vars, for testing only):
 #   chap-secrets, ipsec.secrets, l2tp-secrets,
 #   /var/log/vpn-usage/totals.db, /var/log/vpn-usage/sessions.log,
 #   /run/vpn-sessions/*
+# Also test-only: EZL2TP_ROOT (prefix for the backup / uninstall paths),
+#   EZL2TP_BACKUP_ROOT, EZL2TP_VERSION_FILE, EZL2TP_RUN_DIR, EZL2TP_COLOR,
+#   EZL2TP_ALLOW_NONROOT, EZL2TP_RESTART_WAIT.
 #
 # Usage and online status (users, status, the menu header) come from
 # "l2tp-user usage": totals.db PLUS the live counters of open sessions
@@ -46,10 +54,27 @@ TOTALS_DB="${EZL2TP_TOTALS_DB:-/var/log/vpn-usage/totals.db}"
 SESSIONS_LOG="${EZL2TP_SESSIONS_LOG:-/var/log/vpn-usage/sessions.log}"
 SESSIONS_DIR="${EZL2TP_SESSIONS_DIR:-/run/vpn-sessions}"
 L2TP_USER="${EZL2TP_L2TP_USER:-/usr/local/bin/l2tp-user}"
+RUN_DIR="${EZL2TP_RUN_DIR:-/run}"
 
-# C_BOLD/C_YELLOW/C_CYAN are reserved for PR 2 (menu polish).
+# Backup / update / uninstall. EZL2TP_ROOT is a path prefix so the tests can
+# work on a fake filesystem; it is empty on a real server.
+ROOTFS="${EZL2TP_ROOT:-}"
+BACKUP_ROOT="${EZL2TP_BACKUP_ROOT:-/root}"
+BACKUP_MARK=".easyl2tp-backup"
+VERSION_FILE="${EZL2TP_VERSION_FILE:-/var/lib/easyl2tp/version}"
+UPDATE_REPO="${EZL2TP_REPO:-hesamhanari/easyl2tp}"
+UPDATE_BRANCH="${EASYL2TP_BRANCH:-main}"
+RESTART_WAIT="${EZL2TP_RESTART_WAIT:-2}"
+
+# Colors: on a terminal, or when EZL2TP_COLOR=always; EZL2TP_COLOR=never turns
+# them off. C_BOLD/C_YELLOW/C_CYAN are reserved for menu polish.
+case "${EZL2TP_COLOR:-auto}" in
+  always) use_color=1 ;;
+  never) use_color=0 ;;
+  *) if [ -t 1 ]; then use_color=1; else use_color=0; fi ;;
+esac
 # shellcheck disable=SC2034
-if [ -t 1 ]; then
+if [ "$use_color" = 1 ]; then
   C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_RED='\033[31m'
   C_YELLOW='\033[33m'; C_CYAN='\033[36m'; C_RESET='\033[0m'
 else
@@ -103,9 +128,12 @@ tun_pass() {
   awk '{print $3; exit}' "$L2TP_SECRETS" 2>/dev/null || true
 }
 
+# One name per line, sorted the same way as "l2tp-user stats" (C locale), so a
+# user keeps the same number in the menu even after their password is changed
+# (which moves their line to the end of chap-secrets).
 list_users() {
   [ -f "$CHAP" ] || return 0
-  awk '!/^#/ && NF >= 3 { gsub(/"/, "", $1); if ($1 != "") print $1 }' "$CHAP" 2>/dev/null
+  awk '!/^#/ && NF >= 3 { gsub(/"/, "", $1); if ($1 != "") print $1 }' "$CHAP" 2>/dev/null | LC_ALL=C sort -u
 }
 
 user_pass() {
@@ -294,18 +322,41 @@ EOF
   echo "=================================================="
 }
 
-show_users() {
-  local u rx tx sess status lrow lstate lim lcol
-  load_usage
-  echo "=============================================================================="
-  printf "%-16s %-9s %-12s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL" "LIMIT"
-  echo "------------------------------------------------------------------------------"
+# Users of the last show_users call, in table order: row N = USERS_LIST[N-1].
+USERS_LIST=()
+
+# Fills USERS_LIST from list_users.
+load_users_list() {
+  local u
+  USERS_LIST=()
   while IFS= read -r u; do
-    [ -n "$u" ] || continue
+    [ -n "$u" ] && USERS_LIST+=("$u")
+  done <<EOF
+$(list_users)
+EOF
+  return 0
+}
+
+# One table: usage, limit and status of every user. Rows come from the same
+# "l2tp-user usage" rows as "l2tp-user stats" and the status screen (totals.db
+# plus the live counters of open sessions), so they cannot disagree.
+# "numbered" adds a # column for the menu; rows are green when the user has a
+# live session and red when offline.
+show_users() {
+  local numbered="${1:-}" u rx tx sess status lrow lstate lim lcol color prefix hdr rule n=0
+  load_usage
+  load_users_list
+  if [ -n "$numbered" ]; then hdr="  #  "; rule=83; else hdr=""; rule=78; fi
+  printf '%*s\n' "$rule" "" | tr ' ' '='
+  printf "%s%-16s %-9s %-12s %-12s %-12s %-12s\n" "$hdr" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL" "LIMIT"
+  printf '%*s\n' "$rule" "" | tr ' ' '-'
+  if [ "${#USERS_LIST[@]}" -eq 0 ]; then echo "No users yet."; fi
+  for u in "${USERS_LIST[@]+"${USERS_LIST[@]}"}"; do
+    n=$((n + 1))
     read -r rx tx sess <<EOF
 $(user_usage "$u")
 EOF
-    if [ "$sess" != "-" ]; then status="ONLINE"; else status="offline"; fi
+    if [ "$sess" != "-" ]; then status="ONLINE"; color="$C_GREEN"; else status="offline"; color="$C_RED"; fi
     lrow="$(user_limit_row "$u")"
     lcol="unlimited"
     if [ -n "$lrow" ]; then
@@ -314,12 +365,14 @@ EOF
       lcol="$(human "$lim")"
       if [ "$lstate" = "BLOCKED" ]; then status="BLOCKED"; fi
     fi
-    printf "%-16s %-9s %-12s %-12s %-12s %-12s\n" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))" "$lcol"
-    if [ -n "$lrow" ]; then describe_limit "    -> " "$u"; fi
-  done <<EOF
-$(list_users)
-EOF
-  echo "=============================================================================="
+    prefix=""
+    if [ -n "$numbered" ]; then prefix="$(printf '%3s  ' "$n")"; fi
+    printf "%b%s%-16s %-9s %-12s %-12s %-12s %-12s%b\n" "$color" "$prefix" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))" "$lcol" "$C_RESET"
+    if [ -n "$lrow" ]; then
+      printf '%b%s%b\n' "$color" "$(describe_limit "    -> " "$u")" "$C_RESET"
+    fi
+  done
+  printf '%*s\n' "$rule" "" | tr ' ' '='
   echo "(Passwords are NOT shown here. Use 'card <user>' for one user's card.)"
   echo "(LIMIT: 'ezl2tp limit <user> <GB>' sets one, 'ezl2tp limit <user> clear' removes it.)"
 }
@@ -372,33 +425,31 @@ require_l2tp_user() {
   return 0
 }
 
-# Sets SELECTED_USER from a numbered list, or returns 1.
-pick_user() {
-  local i=0 u choice
-  echo "Users:"
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
-    i=$((i + 1))
-    printf "  %s) %s\n" "$i" "$u"
-    eval "PICK_$i=\$u"
-  done <<EOF
-$(list_users)
-EOF
-  if [ "$i" -eq 0 ]; then echo "No users yet."; return 1; fi
-  printf "Select a user number: "
-  read -r choice
-  case "$choice" in
-    ''|*[!0-9]*) echo "Invalid choice."; return 1 ;;
-  esac
-  if [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then echo "Out of range."; return 1; fi
-  eval "SELECTED_USER=\$PICK_$choice"
-  return 0
+# Reads one line into REPLY_VAL. End of input (the SSH session dropped, or a
+# script ran out of answers) ends the panel instead of looping on empty
+# answers. Call it directly, never inside $( ).
+ask() {
+  printf '%s' "$1"
+  IFS= read -r REPLY_VAL || { echo; echo "Bye."; exit 0; }
 }
+
+# Prints the prompt and succeeds only for exactly YES (no spaces, any other
+# answer or end of input cancels).
+confirm_yes() {
+  local ans
+  printf '%s' "$1"
+  IFS= read -r ans || ans=""
+  [ "$ans" = "YES" ]
+}
+
+user_exists() { [ -n "$(user_pass "$1")" ]; }
+
+random_secret() { openssl rand -hex 6 2>/dev/null || echo changeme; }
 
 do_add() {
   local user="$1" pass="$2"
   require_l2tp_user || return 1
-  if [ -n "$(user_pass "$user")" ]; then
+  if user_exists "$user"; then
     echo "User '$user' already exists. Delete it first, or pick another name."
     return 1
   fi
@@ -408,10 +459,244 @@ do_add() {
 do_del() {
   local user="$1"
   require_l2tp_user || return 1
-  printf "Delete user '%s'? This cannot be undone. Type YES to confirm: " "$user"
-  read -r ans
-  if [ "$ans" != "YES" ]; then echo "Cancelled."; return 0; fi
+  if ! confirm_yes "Delete user '$user'? This cannot be undone. Type YES to confirm: "; then echo "Cancelled."; return 0; fi
   "$L2TP_USER" del "$user"
+}
+
+# Data-limit answer -> "clear" (0 or the word clear = unlimited) or the number
+# of GB; the empty answer gives $2 (the default). Returns 1 for anything else.
+# The number rule is the one l2tp-user applies.
+parse_limit_answer() {
+  local a="${1:-}" def="${2:-}"
+  a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+  [ -z "$a" ] && a="$def"
+  if [ "$a" = "clear" ]; then echo clear; return 0; fi
+  if ! printf '%s' "$a" | grep -Eq '^[0-9]{1,7}(\.[0-9]{1,6})?$'; then return 1; fi
+  if awk -v v="$a" 'BEGIN { exit !(v + 0 == 0) }'; then echo clear; else echo "$a"; fi
+}
+
+# "Add user": name, password (or random), data limit in GB, then the card.
+# The limit is checked before the user is created, so a bad answer or an old
+# l2tp-user that cannot do limits creates nothing.
+add_user_flow() {
+  local nu np nl limit add_out
+  require_l2tp_user || return 1
+  ask "New username: "; nu="$REPLY_VAL"
+  if ! printf '%s' "$nu" | grep -Eq '^[A-Za-z0-9._-]{1,32}$'; then
+    echo "Invalid username: use 1-32 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)."
+    return 1
+  fi
+  if user_exists "$nu"; then
+    echo "User '$nu' already exists. Delete it first, or pick another name."
+    return 1
+  fi
+  # read without -s on purpose: over SSH from a phone a hidden prompt is easy
+  # to mistype with no feedback.
+  ask "Password (Enter = random): "; np="$REPLY_VAL"
+  if [ -z "$np" ]; then
+    np="$(random_secret)"
+  elif ! printf '%s' "$np" | grep -Eq '^[A-Za-z0-9._-]{6,64}$'; then
+    echo "Invalid password: use 6-64 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)."
+    return 1
+  fi
+  ask "Data limit in GB (Enter = 1 GB, 0 or clear = unlimited): "; nl="$REPLY_VAL"
+  if ! limit="$(parse_limit_answer "$nl" 1)"; then
+    echo "Invalid limit '$nl': give a number of GB such as 1 or 12.5, 0, or the word clear."
+    return 1
+  fi
+  if [ "$limit" != "clear" ] && ! l2tp_user_has_limits; then
+    echo "ERROR: the installed $L2TP_USER does not know data limits yet, so no user was added."
+    echo "Update it by running the easyl2tp install.sh again (your users are kept)."
+    return 1
+  fi
+  if ! add_out="$("$L2TP_USER" add "$nu" "$np" 2>&1)"; then
+    printf '%s\n' "$add_out"
+    return 1
+  fi
+  echo "User '$nu' created."
+  if [ "$limit" != "clear" ]; then
+    if ! do_limit "$nu" "$limit"; then
+      echo "The user exists but has NO limit. Set one with: ezl2tp limit $nu <GB>"
+    fi
+  else
+    echo "No data limit: $nu is unlimited."
+  fi
+  show_card "$nu"
+}
+
+# Change a user's password: l2tp-user add replaces the user's chap-secrets,
+# pap-secrets and ipsec.secrets lines. Their limit and usage are not touched.
+change_password() {
+  local user="$1" np pw_out
+  require_l2tp_user || return 1
+  ask "New password for $user (Enter = random): "; np="$REPLY_VAL"
+  if [ -z "$np" ]; then
+    np="$(random_secret)"
+  elif ! printf '%s' "$np" | grep -Eq '^[A-Za-z0-9._-]{6,64}$'; then
+    echo "Invalid password: use 6-64 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)."
+    return 1
+  fi
+  if ! pw_out="$("$L2TP_USER" add "$user" "$np" 2>&1)"; then
+    printf '%s\n' "$pw_out"
+    return 1
+  fi
+  echo "Password changed for $user. Their data limit and usage are unchanged."
+  echo "A session that is connected now keeps working until it reconnects."
+  show_card "$user"
+}
+
+# Set / clear one user's data limit. 0 or "clear" = unlimited.
+set_limit_flow() {
+  local user="$1" nl limit cur
+  load_usage
+  cur="$(describe_limit "" "$user")"
+  if [ -n "$cur" ]; then echo "Now: $cur"; else echo "Now: unlimited"; fi
+  ask "Limit for $user in GB (50 or 12.5; 0 or clear = unlimited; Enter = cancel): "; nl="$REPLY_VAL"
+  if [ -z "$nl" ]; then echo "Cancelled."; return 0; fi
+  if ! limit="$(parse_limit_answer "$nl")"; then
+    echo "Invalid limit '$nl': give a number of GB such as 50 or 12.5, 0, or the word clear."
+    return 1
+  fi
+  do_limit "$user" "$limit"
+}
+
+# Zero the usage of one user (and restart their limit period). The limit stays.
+reset_data() {
+  local user="$1"
+  require_l2tp_user || return 1
+  if ! confirm_yes "Reset the data usage of '$user' to zero? Type YES to confirm: "; then echo "Cancelled."; return 0; fi
+  "$L2TP_USER" reset "$user"
+}
+
+# End one pppd, the way the limit check does: only a real pppd, found through
+# its pid file.
+kill_ppp() {
+  local pidfile="$RUN_DIR/$1.pid" pid=""
+  [ -r "$pidfile" ] || return 1
+  read -r pid < "$pidfile" || true
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "pppd" ] || return 1
+  kill "$pid" 2>/dev/null
+}
+
+# SA ids of the IKEv2 sessions of one user, from "ipsec statusall".
+ikev2_sa_ids() {
+  ipsec statusall 2>/dev/null | awk -v u="$1" '
+    /ikev2-psk\[[0-9]+\]: ESTABLISHED/ {
+      line = $0
+      if (!match(line, /ikev2-psk\[[0-9]+\]/)) next
+      id = substr(line, RSTART + 10, RLENGTH - 11)
+      cur = ""
+      if (match(line, /\.\.\.[^ ]+\[[^]]+\]/)) {
+        cur = substr(line, RSTART, RLENGTH)
+        sub(/^.*\[/, "", cur); sub(/\]$/, "", cur); gsub(/"/, "", cur)
+      }
+      if (cur == u) print id
+    }'
+}
+
+# Disconnect now: end every live session of the user. They can reconnect at
+# once; this blocks nothing (a data limit does that).
+disconnect_now() {
+  local user="$1" rx tx sess s dev id ended=0 failed=0
+  load_usage
+  read -r rx tx sess <<EOF
+$(user_usage "$user")
+EOF
+  if [ "$sess" = "-" ]; then echo "$user is not connected."; return 0; fi
+  for s in $(printf '%s' "$sess" | tr ',' ' '); do
+    case "$s" in
+      "L2TP(ppp"*)
+        dev="${s#L2TP(}"; dev="${dev%)}"
+        if kill_ppp "$dev"; then echo "Disconnected $s"; ended=$((ended + 1)); else echo "Could not disconnect $s"; failed=$((failed + 1)); fi
+        ;;
+    esac
+  done
+  case "$sess" in
+    *"IKEv2("*)
+      for id in $(ikev2_sa_ids "$user"); do
+        if ipsec down "ikev2-psk[$id]" >/dev/null 2>&1; then echo "Disconnected IKEv2 (sa $id)"; ended=$((ended + 1)); else echo "Could not disconnect IKEv2 (sa $id)"; failed=$((failed + 1)); fi
+      done
+      ;;
+  esac
+  if [ "$ended" -eq 0 ] && [ "$failed" -eq 0 ]; then echo "No session of $user could be found to disconnect ($sess)."; fi
+  echo "$user can reconnect right away. To keep them out, set a data limit or delete the user."
+}
+
+# The menu of one user. Returns when the user picks Back or the user is gone.
+user_menu() {
+  local user="$1" row sess
+  while true; do
+    if ! user_exists "$user"; then echo "User '$user' no longer exists."; return 0; fi
+    load_usage
+    [ -t 1 ] && clear 2>/dev/null
+    read -r _ _ sess <<EOF
+$(user_usage "$user")
+EOF
+    echo "=================================================="
+    echo "  User: $user"
+    echo "=================================================="
+    if [ "$sess" != "-" ]; then printf "Status: %bONLINE%b (%s)\n" "$C_GREEN" "$C_RESET" "$sess"; else printf "Status: %boffline%b\n" "$C_RED" "$C_RESET"; fi
+    row="$(describe_limit "" "$user")"
+    if [ -n "$row" ]; then echo "Limit:  $row"; else echo "Limit:  unlimited"; fi
+    echo "--------------------------------------------------"
+    echo "1 Show card"
+    echo "2 Change password"
+    echo "3 Set / clear data limit"
+    echo "4 Reset data"
+    echo "5 Disconnect now"
+    echo "6 Delete user"
+    echo "0 Back"
+    echo "--------------------------------------------------"
+    ask "Choice: "
+    case "$REPLY_VAL" in
+      1) show_card "$user"; pause ;;
+      2) change_password "$user"; pause ;;
+      3) set_limit_flow "$user"; pause ;;
+      4) reset_data "$user"; pause ;;
+      5) disconnect_now "$user"; pause ;;
+      6) do_del "$user"; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+# User Management > Show all users: the numbered table, then pick a number.
+show_all_users_menu() {
+  local pick
+  while true; do
+    [ -t 1 ] && clear 2>/dev/null
+    show_users numbered
+    if [ "${#USERS_LIST[@]}" -eq 0 ]; then pause; return 0; fi
+    ask "Select a user number (0 = back): "; pick="$REPLY_VAL"
+    case "$pick" in
+      0|'') return 0 ;;
+      *[!0-9]*) echo "Invalid choice."; sleep 1; continue ;;
+    esac
+    if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#USERS_LIST[@]}" ]; then echo "Out of range."; sleep 1; continue; fi
+    user_menu "${USERS_LIST[$((pick - 1))]}"
+  done
+}
+
+user_management_menu() {
+  while true; do
+    [ -t 1 ] && clear 2>/dev/null
+    echo "=================================================="
+    echo "  User Management"
+    echo "=================================================="
+    echo "1 Show all users"
+    echo "2 Add user"
+    echo "0 Back"
+    echo "--------------------------------------------------"
+    ask "Choice: "
+    case "$REPLY_VAL" in
+      1) show_all_users_menu ;;
+      2) add_user_flow; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
 }
 
 # The data-limit block of a card: limit, used, remaining, period end, status.
@@ -498,8 +783,262 @@ do_limit() {
 do_restart() {
   echo "Restarting strongswan-starter, xl2tpd, l2tp-firewall..."
   systemctl restart strongswan-starter xl2tpd l2tp-firewall 2>&1
-  sleep 2
+  sleep "$RESTART_WAIT"
   show_status
+}
+
+# ---- Backup -----------------------------------------------------------------
+# The set: everything install.sh backs up before it overwrites it (ipsec,
+# strongswan, xl2tpd, ppp options, chap/pap secrets, sysctl), plus the panel
+# and CLI files, the firewall script, the totals database, the limits database
+# and the sessions log. tests/panel-test.sh checks that every file the
+# installer backs up is in this list.
+backup_set() {
+  cat <<'SET'
+/etc/ipsec.conf
+/etc/ipsec.secrets
+/etc/strongswan.conf
+/etc/xl2tpd/xl2tpd.conf
+/etc/xl2tpd/l2tp-secrets
+/etc/ppp/options.xl2tpd
+/etc/ppp/chap-secrets
+/etc/ppp/pap-secrets
+/etc/sysctl.d/99-l2tp.conf
+/usr/local/bin/ezl2tp
+/usr/local/bin/l2tp-user
+/usr/local/sbin/l2tp-fw.sh
+/var/log/vpn-usage/totals.db
+/var/lib/easyl2tp/limits.db
+/var/log/vpn-usage/sessions.log
+SET
+}
+
+# Makes /root/easyl2tp-backup-YYYYmmdd-HHMMSS (mode 0700, same file paths
+# below it as on the server) and prints ONLY its path. Everything else goes to
+# stderr; no secret is ever printed. Returns 1 and leaves no half-made backup
+# if anything fails.
+make_backup() {
+  local stamp dest n=1 p src copied=0
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dest="$BACKUP_ROOT/easyl2tp-backup-$stamp"
+  while [ -e "$dest" ]; do n=$((n + 1)); dest="$BACKUP_ROOT/easyl2tp-backup-$stamp-$n"; done
+  if ! ( umask 077; mkdir -p "$BACKUP_ROOT" && mkdir -m 700 "$dest" ) 2>/dev/null; then
+    echo "ERROR: could not create a backup folder under $BACKUP_ROOT." >&2
+    return 1
+  fi
+  while IFS= read -r p; do
+    src="$ROOTFS$p"
+    [ -f "$src" ] || continue
+    if ! ( umask 077; mkdir -p "$dest$(dirname "$p")" ) || ! cp -a "$src" "$dest$p" 2>/dev/null; then
+      echo "ERROR: could not back up $p." >&2
+      rm -rf "$dest"
+      return 1
+    fi
+    copied=$((copied + 1))
+  done <<EOF
+$(backup_set)
+EOF
+  if [ "$copied" -eq 0 ]; then
+    echo "ERROR: none of the easyl2tp files were found, so there is nothing to back up." >&2
+    rm -rf "$dest"
+    return 1
+  fi
+  ( umask 077; : > "$dest/$BACKUP_MARK" )
+  chmod 700 "$dest"
+  printf '%s\n' "$dest"
+}
+
+BACKUP_LIST=()
+collect_backups() {
+  local d
+  BACKUP_LIST=()
+  for d in "$BACKUP_ROOT"/easyl2tp-backup-*; do
+    [ -d "$d" ] && BACKUP_LIST+=("$d")
+  done
+  return 0
+}
+
+# Numbered list of existing backups. Returns 1 when there are none.
+list_backups() {
+  local d i=0 files kind
+  collect_backups
+  if [ "${#BACKUP_LIST[@]}" -eq 0 ]; then echo "No backups yet in $BACKUP_ROOT."; return 1; fi
+  for d in "${BACKUP_LIST[@]}"; do
+    i=$((i + 1))
+    files="$(find "$d" -type f ! -name "$BACKUP_MARK" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ -f "$d/$BACKUP_MARK" ]; then kind="$files files"; else kind="$files files, made by the installer: restore by hand"; fi
+    printf "%3s  %s  (%s)\n" "$i" "$d" "$kind"
+  done
+}
+
+do_backup() {
+  local path
+  if ! path="$(make_backup)"; then return 1; fi
+  echo "Backup created: $path"
+  echo "It holds your secrets (root-only, mode 0700). Keep it private."
+}
+
+# Put the files of one panel backup back (only paths from backup_set, each
+# swapped in with a rename so a running ezl2tp/l2tp-user is never half-written).
+restore_files() {
+  local src="$1" p dst n=0
+  while IFS= read -r p; do
+    [ -f "$src$p" ] || continue
+    dst="$ROOTFS$p"
+    mkdir -p "$(dirname "$dst")" || return 1
+    if ! cp -a "$src$p" "$dst.ezl2tp-restore" || ! mv -f "$dst.ezl2tp-restore" "$dst"; then
+      rm -f "$dst.ezl2tp-restore"
+      echo "ERROR: could not restore $p." >&2
+      return 1
+    fi
+    n=$((n + 1))
+  done <<EOF
+$(backup_set)
+EOF
+  echo "Restored $n files."
+}
+
+do_restore() {
+  local pick src pre
+  if ! list_backups; then return 0; fi
+  ask "Restore which backup number (0 = cancel): "; pick="$REPLY_VAL"
+  case "$pick" in
+    0|'') echo "Cancelled."; return 0 ;;
+    *[!0-9]*) echo "Invalid choice."; return 1 ;;
+  esac
+  if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#BACKUP_LIST[@]}" ]; then echo "Out of range."; return 1; fi
+  src="${BACKUP_LIST[$((pick - 1))]}"
+  if [ ! -f "$src/$BACKUP_MARK" ]; then
+    echo "$src was made by the installer, which keeps flat copies the panel cannot place by itself."
+    echo "Copy the files back by hand if you need them."
+    return 1
+  fi
+  echo "Restoring replaces the config, users, secrets and limits on this server"
+  echo "with the ones in $src."
+  if ! confirm_yes "Type YES to restore: "; then echo "Cancelled."; return 0; fi
+  if ! pre="$(make_backup)"; then echo "Could not back up the current state first, so nothing was changed."; return 1; fi
+  echo "Current state saved first: $pre"
+  restore_files "$src" || return 1
+  do_restart
+}
+
+backup_menu() {
+  while true; do
+    [ -t 1 ] && clear 2>/dev/null
+    echo "=================================================="
+    echo "  Backup"
+    echo "=================================================="
+    echo "1 Create backup"
+    echo "2 List backups"
+    echo "3 Restore backup"
+    echo "0 Back"
+    echo "--------------------------------------------------"
+    ask "Choice: "
+    case "$REPLY_VAL" in
+      1) do_backup; pause ;;
+      2) list_backups; pause ;;
+      3) do_restore; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+# ---- Check For Updates ------------------------------------------------------
+# install.sh writes the commit it installed to $VERSION_FILE. An install from
+# before that file existed has none: that is reported as "not recorded" and
+# never as an error.
+installed_version() {
+  local v=""
+  if [ -r "$VERSION_FILE" ]; then read -r v < "$VERSION_FILE" || true; fi
+  if printf '%s' "$v" | grep -Eq '^[0-9a-f]{40}$'; then printf '%s' "$v"; fi
+}
+
+# The commit at the tip of the branch on GitHub; nothing if it cannot be read
+# (no internet, rate limit, or a private repo).
+latest_version() {
+  local v=""
+  v="$(curl -fsSL --max-time 10 -H 'Accept: application/vnd.github.sha' \
+    "https://api.github.com/repos/$UPDATE_REPO/commits/$UPDATE_BRANCH" 2>/dev/null || true)"
+  if printf '%s' "$v" | grep -Eq '^[0-9a-f]{40}$'; then printf '%s' "$v"; fi
+}
+
+# Download install.sh into a private folder and run it. The installer keeps the
+# users, the secrets and the limits (see install.sh). It replaces this very
+# script, so the caller must exit right after.
+run_installer() {
+  local commit="$1" dir rc
+  dir="$(mktemp -d)" || return 1
+  if ! curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/install.sh" -o "$dir/install.sh" 2>/dev/null \
+    || [ "$(head -n 1 "$dir/install.sh" 2>/dev/null)" != "#!/bin/bash" ] || ! bash -n "$dir/install.sh" 2>/dev/null; then
+    rm -rf "$dir"
+    echo "Could not download a valid install.sh from GitHub. Nothing was changed."
+    return 1
+  fi
+  UPDATE_RAN=1
+  EASYL2TP_COMMIT="$commit" EASYL2TP_BRANCH="$UPDATE_BRANCH" bash "$dir/install.sh"
+  rc=$?
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# UPDATE_RAN=1 once the installer was started (the caller then exits: the
+# installer replaces this script, and bash must not read on in the old file).
+UPDATE_RAN=0
+check_updates() {
+  local cur latest backup
+  UPDATE_RAN=0
+  cur="$(installed_version)"
+  echo "Installed version: ${cur:-not recorded (installed before version tracking)}"
+  latest="$(latest_version)"
+  if [ -z "$latest" ]; then
+    echo "Latest on $UPDATE_BRANCH:   could not be read from GitHub."
+    echo "Check the internet connection and try again (a private repo cannot be read without a login)."
+    return 1
+  fi
+  echo "Latest on $UPDATE_BRANCH:   $latest"
+  if [ "$cur" = "$latest" ]; then echo "You are up to date."; return 0; fi
+  if [ -z "$cur" ]; then
+    echo "An update may be available: this install has no recorded version to compare with."
+  else
+    echo "An update is available."
+  fi
+  echo "Updating runs the installer from $UPDATE_BRANCH again. Your users, secrets and"
+  echo "limits are kept, and a backup is taken first."
+  if ! confirm_yes "Type YES to update now: "; then echo "Cancelled. Nothing was changed."; return 0; fi
+  if ! backup="$(make_backup)"; then echo "Could not take a backup first, so nothing was changed."; return 1; fi
+  echo "Backup created: $backup"
+  if run_installer "$latest"; then
+    echo "Update finished. Run ezl2tp again to open the new panel."
+  else
+    echo "The update did not finish. Your backup is at $backup"
+    return 1
+  fi
+}
+
+# ---- Uninstall --------------------------------------------------------------
+# Never deletes a backup. Users, secrets, limits and logs stay on disk too;
+# only the services are stopped and the panel and CLI are removed.
+UNINSTALLED=0
+do_uninstall() {
+  local backup s
+  UNINSTALLED=0
+  echo "UNINSTALL easyl2tp: this stops and disables the VPN services"
+  echo "(strongswan-starter, xl2tpd, l2tp-firewall, easyl2tp-limits.timer) and removes"
+  echo "the ezl2tp panel and the l2tp-user CLI. VPN users stop working."
+  echo "A backup is taken first and is never deleted."
+  if ! confirm_yes "Type YES to uninstall: "; then echo "Cancelled. Nothing was changed."; return 0; fi
+  if ! backup="$(make_backup)"; then echo "Could not take a backup first, so nothing was removed."; return 1; fi
+  echo "Backup created: $backup"
+  for s in strongswan-starter xl2tpd l2tp-firewall easyl2tp-limits.timer; do
+    systemctl disable --now "$s" >/dev/null 2>&1 || echo "Note: could not stop/disable $s (it may not be installed)."
+  done
+  rm -f "$ROOTFS/usr/local/bin/ezl2tp" "$ROOTFS/usr/local/bin/l2tp-user"
+  UNINSTALLED=1
+  echo "Services stopped and disabled; ezl2tp and l2tp-user removed."
+  echo "Your backup is kept: $backup"
+  echo "Users, secrets, limits and logs were left on disk. Install again with install.sh,"
+  echo "then restore from the backup if you need to."
 }
 
 pause() {
@@ -508,12 +1047,15 @@ pause() {
 }
 
 usage() {
-  echo "Usage: ezl2tp [status|users|stats|live|logs|add|del|card|limit|restart|help]"
+  echo "Usage: ezl2tp [status|users|stats|live|logs|add|del|card|limit|restart|backup|backups|update|help]"
   echo "  No argument: interactive menu."
   echo "  add <user> [password]   (empty password = random)"
   echo "  del <user>   card <user>"
   echo "  limit <user> <GB>       data limit per 30 days, upload + download (50 or 12.5)"
   echo "  limit <user> clear      unlimited"
+  echo "  backup                  make a backup under $BACKUP_ROOT and print its path"
+  echo "  backups                 list existing backups"
+  echo "  update                  compare with $UPDATE_BRANCH and offer to update"
 }
 
 # --- non-interactive mode ---
@@ -525,9 +1067,16 @@ if [ "${1:-}" != "" ]; then
     live)    show_live ;;
     logs)    show_logs ;;
     restart) do_restart ;;
+    backup)  make_backup ;;
+    backups) list_backups ;;
+    update)
+      check_updates
+      rc=$?
+      exit "$rc"
+      ;;
     add)
       if [ -z "${2:-}" ]; then echo "Usage: ezl2tp add <user> [password]"; exit 1; fi
-      p="${3:-}"; [ -z "$p" ] && p="$(openssl rand -hex 6 2>/dev/null || echo changeme)"
+      p="${3:-}"; [ -z "$p" ] && p="$(random_secret)"
       do_add "$2" "$p"
       ;;
     del)
@@ -555,66 +1104,48 @@ if [ "${1:-}" != "" ]; then
 fi
 
 # --- interactive menu ---
-if [ "$(id -u)" != "0" ]; then
+if [ "$(id -u)" != "0" ] && [ -z "${EZL2TP_ALLOW_NONROOT:-}" ]; then
   echo "Run ezl2tp as root."
   exit 1
 fi
 
 while true; do
   load_usage
-  clear 2>/dev/null || true
+  [ -t 1 ] && clear 2>/dev/null
   echo "=================================================="
   echo "  ezl2tp — L2TP + IKEv2 panel"
   echo "=================================================="
   printf "Server: %s   Kernel: %s   Users: %s, %s online\n" \
     "$(server_ip)" "$(uname -r 2>/dev/null || echo unknown)" "$(count_users)" "$(count_online)"
   echo "--------------------------------------------------"
-  echo "  1) Status"
-  echo "  2) Users (online + usage)"
-  echo "  3) Bandwidth stats (l2tp-user stats)"
-  echo "  4) Live sessions"
-  echo "  5) Session logs"
-  echo "  6) Add user"
-  echo "  7) Delete user"
-  echo "  8) Show user card (for sharing)"
-  echo "  9) Restart VPN services"
-  echo " 10) Set or clear a user's data limit"
-  echo "  0) Exit"
+  echo "1 Status"
+  echo "2 User Management"
+  echo "3 Live sessions"
+  echo "4 Logs"
+  echo "5 Restart services"
+  echo "6 Backup"
+  echo "7 Check For Updates"
+  echo "8 Uninstall"
+  echo "0 Exit"
   echo "--------------------------------------------------"
-  printf "Choice: "
-  read -r choice
-  case "$choice" in
+  ask "Choice: "
+  case "$REPLY_VAL" in
     1) show_status; pause ;;
-    2) show_users; pause ;;
-    3) show_stats; pause ;;
-    4) show_live; pause ;;
-    5) show_logs; pause ;;
-    6)
-      printf "New username: "; read -r nu
-      case "$nu" in
-        ''|*[[:space:]\"\'\`]* ) echo "Invalid username (no spaces or quotes)."; pause; continue ;;
-      esac
-      printf "Password (Enter = random): "; read -r np
-      # Note: read without -s on purpose — over SSH from a phone,
-      # a hidden prompt is easy to mistype with no feedback.
-      if [ -z "$np" ]; then np="$(openssl rand -hex 6 2>/dev/null || echo changeme)"; fi
-      do_add "$nu" "$np"; pause
-      ;;
+    2) user_management_menu ;;
+    3) show_live; pause ;;
+    4) show_logs; pause ;;
+    5) do_restart; pause ;;
+    6) backup_menu ;;
     7)
-      if pick_user; then do_del "$SELECTED_USER"; fi
+      check_updates
+      # The installer replaced this script. Never read on in the old file.
+      if [ "$UPDATE_RAN" = 1 ]; then exit 0; fi
       pause
       ;;
     8)
-      if pick_user; then show_card "$SELECTED_USER"; fi
-      pause
-      ;;
-    9) do_restart; pause ;;
-    10)
-      if pick_user; then
-        printf "Limit for %s in GB (50 or 12.5; the word clear = unlimited): " "$SELECTED_USER"
-        read -r nl
-        do_limit "$SELECTED_USER" "$nl"
-      fi
+      do_uninstall
+      # The panel is gone after an uninstall.
+      if [ "$UNINSTALLED" = 1 ]; then exit 0; fi
       pause
       ;;
     0) echo "Bye."; exit 0 ;;

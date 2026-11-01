@@ -15,15 +15,16 @@ before using it for a real user, and before any public release.
 - An L2TP/IPsec server (IKEv1, for modems and phones that still use
   L2TP) plus an IKEv2 server (for modern phones with built-in
   IKEv2/IPsec PSK support), on a Debian 13 VPS.
-- A bash panel, `ezl2tp`, with an interactive menu and one-shot
-  commands:
-  - status (kernel, PPP device, services, ports, users online)
-  - users (online/offline, upload/download/total — including the
+- A bash panel, `ezl2tp`, with an interactive menu (see "The panel" below)
+  and one-shot commands:
+  - `status` (kernel, PPP device, services, ports, users online)
+  - `users` (online/offline, upload/download/total — including the
     traffic of sessions that are still connected, not only finished ones)
-  - live sessions, session logs, bandwidth stats
-  - add/delete a user, show one user's connection card
+  - `live` sessions, `logs`, `stats`
+  - `add` / `del` a user, `card` for one user's connection card
   - per-user data limits (`ezl2tp limit <user> <GB>`), see "Data limits"
-  - restart the VPN services
+  - `restart` the VPN services
+  - `backup` / `backups` / `update`, see "Backup, updates and uninstall"
 - Usage tracking per user, so an admin can see who used how much.
 
 ## What it is not (yet)
@@ -60,16 +61,19 @@ What the installer does, in order:
    in the environment to rotate them on purpose, or unless a
    previous install already has them, in which case it reuses
    them so existing users keep working.
-4. Backs up any existing configs to `/root/easyl2tp-backup-*`.
+4. Backs up any existing configs to `/root/easyl2tp-backup-*` (the panel's
+   Backup menu makes and restores the same kind of folder).
 5. Installs strongswan-starter (L2TP/IPsec IKEv1 + IKEv2),
    xl2tpd, firewall/NAT, usage tracking, `l2tp-user`, and
-   `ezl2tp` if it can find it.
+   `ezl2tp` if it can find it, and records the installed commit in
+   `/var/lib/easyl2tp/version`.
 6. Prints only the next steps at the end. The secrets are NOT printed:
    they live in root-only files on the server, and each user's card
    (`ezl2tp card <user>`) shows what that user needs.
 
 Re-running the installer is safe for users: it reuses existing
-secrets and preserves existing users in chap-secrets.
+secrets and preserves existing users in chap-secrets and their data limits.
+(The panel's *Check For Updates* is this re-run, with a backup first.)
 
 ### Cloud kernel without PPP (extra steps)
 
@@ -101,6 +105,105 @@ its own kernel and ignores `/boot`), the installer stops with
 image or plan. The installer asks for the terminal, so run it from an
 interactive SSH session, not piped into `bash`.
 
+## The panel
+
+Run `ezl2tp` as root. The main menu is exactly this:
+
+```
+1 Status
+2 User Management
+3 Live sessions
+4 Logs
+5 Restart services
+6 Backup
+7 Check For Updates
+8 Uninstall
+0 Exit
+```
+
+Everything that is about one user lives under **2 User Management**:
+
+```
+1 Show all users
+2 Add user
+0 Back
+```
+
+**Show all users** is one numbered table with every user's status, upload,
+download, total and data limit. Rows of users who are connected are
+**green**, rows of users who are offline are **red** (a user who is over
+their limit shows `BLOCKED` in the status column). The numbers are the same
+ones `ezl2tp users` and `l2tp-user stats` print: the saved totals plus the
+live counters of open sessions. Type a user's number to open that user:
+
+```
+1 Show card
+2 Change password
+3 Set / clear data limit
+4 Reset data
+5 Disconnect now
+6 Delete user
+0 Back
+```
+
+- **Change password** keeps the user's limit and usage. A session that is
+  connected right now keeps working until it reconnects.
+- **Set / clear data limit**: a number of GB (`50`, `12.5`), or `0` / `clear`
+  for unlimited; Enter cancels.
+- **Reset data** and **Delete user** ask you to type `YES`.
+- **Disconnect now** ends the user's live L2TP and IKEv2 sessions. It blocks
+  nothing: the user can reconnect at once (a data limit is what keeps a user
+  out).
+
+**Add user** asks for the name, then the password (Enter = a random one),
+then the data limit in GB: **Enter = 1 GB**, `0` or `clear` = unlimited. It
+shows the new user's card at the end. Users that already exist keep their
+current limit or unlimited state; the 1 GB default only applies to users
+added from this menu (`ezl2tp add <user>` on the command line adds an
+unlimited user, as before).
+
+The old separate top-level items (Users, Bandwidth stats, Add, Delete, Card)
+moved under User Management. The one-shot commands did not change:
+`ezl2tp status`, `users`, `stats`, `live`, `logs`, `add`, `del`, `card`,
+`limit` and `restart` all still work. Colors only show on a terminal.
+
+### Backup, updates and uninstall
+
+**6 Backup** has *Create backup*, *List backups* and *Restore backup*.
+A backup is a folder `/root/easyl2tp-backup-YYYYmmdd-HHMMSS` (mode `0700`) with
+the same files `install.sh` backs up before it overwrites them (ipsec,
+strongSwan, xl2tpd, ppp options, chap/pap secrets, sysctl) plus the panel
+and `l2tp-user`, the firewall script, the totals database, the limits
+database and the sessions log, under their original paths. The panel prints
+**only the path**, never a secret; the backup itself holds your secrets, so
+keep it private. `ezl2tp backup` does the same from the command line and
+prints just the path; `ezl2tp backups` lists them.
+
+*Restore* asks for the backup's number and then for `YES`. It first makes a
+fresh backup of the current state (and tells you where), then puts the files
+back and restarts strongswan-starter, xl2tpd and l2tp-firewall. Backups
+written by `install.sh` itself are flat copies; they are listed but you copy
+those back by hand. After an Uninstall, run `install.sh` first, then restore.
+
+**7 Check For Updates** compares the commit this server was installed from
+(`/var/lib/easyl2tp/version`, written by `install.sh`) with the tip of `main`
+on GitHub. If they differ it says so and asks you to type `YES`; then it
+takes a backup and runs the installer from `main` again. That is the normal
+re-run: your users, secrets (master PSK, tunnel password) and data limits are
+kept. A server installed before version tracking has no recorded version: the
+panel says so, offers the update anyway (the next install records it) and
+does not fail. If GitHub cannot be reached (offline, rate limit, private
+repo) it says that and changes nothing. `ezl2tp update` does the same from the
+command line.
+
+**8 Uninstall** asks you to type `YES`, **takes a backup first** (if that
+fails nothing is removed), then stops and disables `strongswan-starter`,
+`xl2tpd`, `l2tp-firewall` and `easyl2tp-limits.timer`, and removes the
+`ezl2tp` panel and the `l2tp-user` CLI. The backup is kept, always: nothing
+in the panel ever deletes one. Users, secrets, limits and logs stay on disk
+(and in the backup); install again with `install.sh` and restore if you want
+them back.
+
 ### Traffic numbers are live
 
 `ezl2tp users`, `ezl2tp status` and `l2tp-user stats` all show the
@@ -123,8 +226,8 @@ ezl2tp limit test-user1 clear    # unlimited again
 
 (`l2tp-user limit <user> <GB|clear>` does the same; the panel just calls
 it, so the two always agree. GB here means 1024 x 1024 x 1024 bytes, the
-same GB the panel prints.) The menu has the same thing under
-"Set or clear a user's data limit".
+same GB the panel prints.) In the menu it is under User Management > Show
+all users > (pick a user) > Set / clear data limit.
 
 **What counts.** The same numbers as `ezl2tp users`: the saved totals plus
 what connected sessions are using right now. A disconnect moves the live
@@ -182,11 +285,17 @@ then `ezl2tp limit` says so instead of doing anything.
   - `/usr/local/bin/l2tp-user` for add/delete/stats/limits (the panel
     delegates to it, so secret handling stays in one place)
   - `/var/lib/easyl2tp/limits.db` for per-user data limits
+  - `/var/lib/easyl2tp/version` for the installed commit (Check For Updates)
 - `SPEC.md` — the build plan for Claude, in PR order.
 - `AGENTS.md` — the multi-agent workflow for this project.
 - `SECURITY.md` — what must never go into this repo.
 - `tests/smoke-test.sh` — fake-data smoke test for the panel; also runs
-  the three suites below.
+  the four suites below.
+- `tests/panel-test.sh` — the panel menus with fake users: the exact main
+  menu, the numbered green/red table, every per-user action, Add user
+  (1 GB default), backup create / list / restore, the update check and the
+  uninstall guard. Runs the real `l2tp-user` from `install.sh` against a
+  fake server tree.
 - `tests/kernel-fix-test.sh` — the cloud-kernel auto-fix, run against
   stubbed apt/grub/reboot (the exact-`YES` rule, the order of steps,
   the no-loop rule after the reboot).

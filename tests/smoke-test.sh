@@ -134,9 +134,9 @@ else
 fi
 
 # The other suites: the kernel auto-fix, live traffic / online status and
-# per-user data limits. They run the real code from install.sh, so a green
+# per-user data limits and the panel menus. They run the real code from install.sh, so a green
 # smoke test covers them.
-for t in kernel-fix-test.sh live-stats-test.sh limits-test.sh; do
+for t in kernel-fix-test.sh live-stats-test.sh limits-test.sh panel-test.sh; do
   echo "--- $t"
   if bash "$HERE/$t" "$PANEL"; then
     echo "ok: $t"

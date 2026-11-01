@@ -40,6 +40,8 @@
 #   TUNPW="..."       modem tunnel password (default: generated/reused)
 #   IPSEC_PSK="..."   shared IPsec PSK      (default: generated/reused)
 #   EASYL2TP_BRANCH="main"   branch to fetch ezl2tp from, if needed
+#   EASYL2TP_COMMIT="<sha>"  commit to record as installed (the panel's
+#                            Check For Updates passes it; normally unset)
 #
 # What it installs (same tested stack as the original):
 #   strongswan-starter + /etc/ipsec.conf:
@@ -54,6 +56,8 @@
 #     easyl2tp-limits.timer (every 30 seconds)
 #   panel: /usr/local/bin/ezl2tp (if it can be found next to
 #     this script or fetched from the repo; non-fatal if missing)
+#   version stamp: /var/lib/easyl2tp/version (the installed commit, or
+#     "unknown"), read by the panel's Check For Updates
 #
 # This installer does NOT offer PPTP. PPTP encryption is broken.
 # L2TP/IPsec uses a shared PSK by design for L2TP clients;
@@ -1499,6 +1503,27 @@ if [ "$PANEL_INSTALLED" != "1" ]; then
   echo "NOTE: ezl2tp could not be installed automatically (repo is private or panel file was not next to install.sh)."
   echo "Install it later with: cp ezl2tp /usr/local/bin/ezl2tp && chmod +x /usr/local/bin/ezl2tp"
 fi
+
+# --- Version stamp: lets "ezl2tp" > Check For Updates compare this install
+# with the repo. The commit comes from the panel's update (EASYL2TP_COMMIT), or
+# from the git checkout this script runs from (only if it has no local edits),
+# or from GitHub (the tip of the branch, best effort). If none works, "unknown"
+# is written and the panel reports the version as not recorded.
+INSTALLED_COMMIT="${EASYL2TP_COMMIT:-}"
+if [ -z "$INSTALLED_COMMIT" ] && command -v git >/dev/null 2>&1 \
+  && git -C "$SELF_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  && [ -z "$(git -C "$SELF_DIR" status --porcelain 2>/dev/null)" ]; then
+  INSTALLED_COMMIT="$(git -C "$SELF_DIR" rev-parse HEAD 2>/dev/null || true)"
+fi
+if [ -z "$INSTALLED_COMMIT" ] && [ "$PANEL_INSTALLED" = "1" ] && [ ! -f "$SELF_DIR/ezl2tp" ]; then
+  # The panel was fetched from the branch just now, so the branch tip is what is installed.
+  INSTALLED_COMMIT="$(curl -fsSL --max-time 10 -H 'Accept: application/vnd.github.sha' \
+    "https://api.github.com/repos/hesamhanari/easyl2tp/commits/${EASYL2TP_BRANCH:-main}" 2>/dev/null || true)"
+fi
+printf '%s' "$INSTALLED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || INSTALLED_COMMIT="unknown"
+mkdir -p /var/lib/easyl2tp
+printf '%s\n' "$INSTALLED_COMMIT" > /var/lib/easyl2tp/version
+chmod 600 /var/lib/easyl2tp/version
 
 systemctl daemon-reload
 systemctl disable --now strongswan strongswan-swanctl 2>/dev/null || true
