@@ -20,7 +20,15 @@
 # Data sources (overridable with EZL2TP_* env vars, for testing only):
 #   chap-secrets, ipsec.secrets, l2tp-secrets,
 #   /var/log/vpn-usage/totals.db, /var/log/vpn-usage/sessions.log,
-#   /run/vpn-sessions/*, /sys/class/net/ppp*
+#   /run/vpn-sessions/*
+#
+# Usage and online status (users, status, the menu header) come from
+# "l2tp-user usage": totals.db PLUS the live counters of open sessions
+# (ppp interface counters for L2TP, iptables IKEV2_UP_/IKEV2_DOWN_ counters
+# for IKEv2), with online status taken from /run/vpn-sessions/*. The same
+# rows feed "l2tp-user stats", so the two can never disagree. If l2tp-user
+# is an older copy without that command, the panel falls back to the saved
+# totals plus the session files (no live bytes) and never calls it.
 
 set -u
 
@@ -99,6 +107,27 @@ user_pass() {
   awk -v u="$want" '{ gsub(/"/, ""); if ($1 == u) { print $3; exit } }' "$CHAP" 2>/dev/null
 }
 
+# Rows "<user> <upload> <download> <sessions>" from "l2tp-user usage".
+USAGE_ROWS=""
+USAGE_LIVE=0
+
+# Older l2tp-user copies treat any unknown word as a NEW USERNAME to add, so
+# "usage" is only sent to a copy that carries this marker line.
+l2tp_user_has_usage() {
+  [ -x "$L2TP_USER" ] && grep -q '^# easyl2tp-api: usage-v1$' "$L2TP_USER" 2>/dev/null
+}
+
+# Refresh the rows. Call at the start of every screen that shows usage.
+load_usage() {
+  USAGE_ROWS=""
+  USAGE_LIVE=0
+  if l2tp_user_has_usage && USAGE_ROWS="$("$L2TP_USER" usage 2>/dev/null)"; then
+    USAGE_LIVE=1
+  else
+    USAGE_ROWS=""
+  fi
+}
+
 user_totals() {
   local want="$1" rx=0 tx=0
   if [ -f "$TOTALS_DB" ]; then
@@ -107,6 +136,23 @@ $(awk -v u="$want" '$1 == u {print $2, $3; exit}' "$TOTALS_DB" 2>/dev/null)
 EOF
   fi
   printf '%s %s' "${rx:-0}" "${tx:-0}"
+}
+
+# Prints "<upload> <download> <sessions>" for one user, sessions "-" if offline.
+user_usage() {
+  local want="$1" rx tx sess
+  if [ "$USAGE_LIVE" = 1 ]; then
+    read -r rx tx sess <<EOF
+$(printf '%s\n' "$USAGE_ROWS" | awk -v u="$want" '$1 == u { print $2, $3, $4; exit }')
+EOF
+  else
+    # Older l2tp-user: saved totals plus session files, no live bytes.
+    read -r rx tx <<EOF
+$(user_totals "$want")
+EOF
+    sess="$(user_sessions "$want" | awk '{ printf "%s%s", (n++ ? "," : ""), $1 }')"
+  fi
+  printf '%s %s %s' "${rx:-0}" "${tx:-0}" "${sess:--}"
 }
 
 # Prints one line per live session for a user: "ppp3 <peer IP>" etc.
@@ -127,7 +173,9 @@ count_users() { list_users | wc -l | tr -d ' '; }
 
 count_online() {
   local n=0
-  if [ -d "$SESSIONS_DIR" ]; then
+  if [ "$USAGE_LIVE" = 1 ]; then
+    n="$(printf '%s\n' "$USAGE_ROWS" | awk '$4 != "" && $4 != "-" { n++ } END { print n + 0 }')"
+  elif [ -d "$SESSIONS_DIR" ]; then
     # Count distinct users with a live session file, not files.
     n="$(awk '{ gsub(/"/, "", $1); if ($1 != "") print $1 }' "$SESSIONS_DIR"/* 2>/dev/null | sort -u | wc -l | tr -d ' ')"
   fi
@@ -135,7 +183,9 @@ count_online() {
 }
 
 total_traffic() {
-  if [ -f "$TOTALS_DB" ]; then
+  if [ "$USAGE_LIVE" = 1 ]; then
+    printf '%s\n' "$USAGE_ROWS" | awk '{ r += $2; t += $3 } END { printf "%.0f %.0f", r, t }'
+  elif [ -f "$TOTALS_DB" ]; then
     awk '{ r += $2; t += $3 } END { printf "%s %s", r + 0, t + 0 }' "$TOTALS_DB" 2>/dev/null
   else
     printf '0 0'
@@ -157,6 +207,7 @@ svc() {
 
 show_status() {
   local kernel ppp users online rx tx
+  load_usage
   kernel="$(uname -r 2>/dev/null || echo unknown)"
   if [ -e /dev/ppp ]; then ppp="${C_GREEN}yes${C_RESET}"; else ppp="${C_RED}no${C_RESET}"; fi
   users="$(count_users)"; online="$(count_online)"
@@ -189,16 +240,17 @@ EOF
 }
 
 show_users() {
-  local u rx tx status
+  local u rx tx sess status
+  load_usage
   echo "=================================================="
   printf "%-16s %-9s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL"
   echo "--------------------------------------------------"
   while IFS= read -r u; do
     [ -n "$u" ] || continue
-    if [ -n "$(user_sessions "$u")" ]; then status="ONLINE"; else status="offline"; fi
-    read -r rx tx <<EOF
-$(user_totals "$u")
+    read -r rx tx sess <<EOF
+$(user_usage "$u")
 EOF
+    if [ "$sess" != "-" ]; then status="ONLINE"; else status="offline"; fi
     printf "%-16s %-9s %-12s %-12s %-12s\n" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))"
   done <<EOF
 $(list_users)
@@ -388,6 +440,7 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 while true; do
+  load_usage
   clear 2>/dev/null || true
   echo "=================================================="
   echo "  ezl2tp — L2TP + IKEv2 panel"

@@ -9,11 +9,13 @@
 #    (see below), or unless a previous install already has them —
 #    in which case the existing values are REUSED, so re-running
 #    this installer does not break existing users.
-#  - PPP is checked FIRST, before any service is stopped or any
-#    config is overwritten. If this kernel cannot do PPP, the
-#    installer stops with a clear message instead of installing
-#    a server that can never connect (Debian cloud kernels can
-#    ship with PPP disabled entirely — see the error message).
+#  - PPP is checked FIRST, before any service is stopped, any
+#    package is installed or any config is overwritten. If this
+#    kernel cannot do PPP, the installer does not install a server
+#    that can never connect. On a Debian cloud kernel (PPP disabled
+#    entirely) it offers to swap in the stock kernel, but only after
+#    a big red warning and an exact "YES" typed by you; then it
+#    reboots and you re-run the installer. See kernel-fix below.
 #  - Existing configs are backed up to /root/easyl2tp-backup-*
 #    before they are overwritten.
 #  - Reviewed against SPEC.md (PR 1): the IKEv1 aggressive-mode PSK
@@ -77,21 +79,28 @@ else
   die "Cannot detect the OS (/etc/os-release missing)."
 fi
 
-# Minimal tools first: we need openssl for secret generation and
-# curl for the server-IP lookup, before anything else.
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y openssl curl >/dev/null 2>&1 || true
-command -v openssl >/dev/null 2>&1 || die "openssl is required but could not be installed."
-command -v curl >/dev/null 2>&1 || die "curl is required but could not be installed."
-
-# --- PPP kernel check: FAIL FAST, before stopping anything ---
+# --- PPP kernel check: the FIRST real step, before anything else ---
 # pppd needs /dev/ppp, which needs the ppp_generic driver.
-# On kernels where PPP is disabled in the config (some Debian
-# cloud kernels), no modprobe or mknod can fix it — only a
-# PPP-enabled kernel can. Installing the VPN on such a kernel
-# would leave a server that accepts L2TP tunnels and then kills
-# every PPP session, so we stop here instead.
-echo "Checking PPP kernel support..."
+# On kernels where PPP is disabled in the config (Debian cloud
+# kernels), no modprobe or mknod can fix it — only a PPP-enabled
+# kernel can. Installing the VPN on such a kernel would leave a
+# server that accepts L2TP tunnels and then kills every PPP session.
+#
+# Nothing below (apt, services, configs) runs before this passes.
+# On a cloud kernel the installer can swap in the stock kernel, but
+# only after a warning and an exact "YES"; see kernel_fix.
+#
+# BEGIN kernel-fix
+# tests/kernel-fix-test.sh extracts everything between BEGIN and END
+# and runs it against stubbed apt/dpkg/grub/reboot. Keep this block
+# self-contained: variables and functions only, no top-level actions.
+KFIX_STATE_DIR="/var/lib/easyl2tp"
+KFIX_STATE_FILE="$KFIX_STATE_DIR/kernel-fix"
+KFIX_BOOT_ID_FILE="/proc/sys/kernel/random/boot_id"
+KFIX_BOOT_DIR="/boot"
+KFIX_GRUB_CFG="/boot/grub/grub.cfg"
+KFIX_MODULES_DIR="/lib/modules"
+
 ppp_ready() {
   modprobe ppp_generic 2>/dev/null && modprobe ppp_async 2>/dev/null \
     && modprobe l2tp_ppp 2>/dev/null || return 1
@@ -105,12 +114,69 @@ ppp_ready() {
   { exec 9<>/dev/ppp; } 2>/dev/null || return 1
   exec 9>&-
 }
-if ! ppp_ready; then
-  if grep -q '^# CONFIG_PPP is not set' "/boot/config-$(uname -r)" 2>/dev/null; then
-    cat >&2 <<'PPPMSG'
+
+# Changes every boot; lets a re-run tell "not rebooted yet" from "rebooted
+# and still the same kernel".
+kfix_boot_id() { cat "$KFIX_BOOT_ID_FILE" 2>/dev/null || echo unknown; }
+
+kfix_is_cloud_kernel() {
+  case "$(uname -r)" in
+    *-cloud-amd64) return 0 ;;
+  esac
+  return 1
+}
+
+# True only when the running kernel has no PPP at all (not just a module
+# that failed to load).
+kfix_kernel_lacks_ppp() {
+  local cfg
+  cfg="$KFIX_BOOT_DIR/config-$(uname -r)"
+  if [ -f "$cfg" ]; then
+    grep -q '^# CONFIG_PPP is not set' "$cfg"
+    return
+  fi
+  ! find "$KFIX_MODULES_DIR/$(uname -r)" -name 'ppp_generic.ko*' 2>/dev/null | grep -q .
+}
+
+# Names of installed packages (dpkg status "i...") matching the given globs.
+kfix_installed_pkgs() {
+  # shellcheck disable=SC2016
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$@" 2>/dev/null \
+    | awk '$1 ~ /^i/ { print $2 }'
+}
+
+# The meta package plus every versioned cloud kernel image.
+kfix_cloud_pkgs() {
+  kfix_installed_pkgs 'linux-image-cloud-amd64' 'linux-image-*-cloud-amd64'
+}
+
+# Versions (as in uname -r) of installed stock amd64 kernels, oldest first.
+kfix_stock_versions() {
+  kfix_installed_pkgs 'linux-image-[0-9]*-amd64' \
+    | sed 's/^linux-image-//' \
+    | grep -Ev -- '-(cloud|rt)-amd64$' \
+    | sort -V
+}
+
+kfix_have_tty() { { : < /dev/tty; } 2>/dev/null; }
+
+# Read the answer from the terminal, never from stdin: stdin can be the
+# script itself (curl ... | bash).
+kfix_read_answer() {
+  local ans=""
+  IFS= read -r ans < /dev/tty || ans=""
+  printf '%s' "$ans"
+}
+
+kfix_red() {
+  if [ -t 1 ]; then printf '\033[1;31m%s\033[0m\n' "$1"; else printf '%s\n' "$1"; fi
+}
+
+kfix_manual_message() {
+  cat >&2 <<'PPPMSG'
 PPP is DISABLED in the running kernel (CONFIG_PPP is not set).
-This is common on Debian cloud kernels. No package, mknod, or
-modprobe can fix it on this kernel.
+No package, mknod, or modprobe can fix it on this kernel, and this
+installer cannot swap the kernel on this system by itself.
 Fix: install a PPP-enabled kernel, for example
   apt-get install -y linux-image-amd64
 then make that kernel the boot default (check grub.cfg order —
@@ -120,6 +186,173 @@ no longer ends in -cloud-amd64 and that
   modprobe ppp_generic
 succeeds. Only then re-run this installer.
 PPPMSG
+}
+
+# The kernel swap. Only reached on a cloud kernel without PPP. Read-only
+# checks first; nothing is changed until the user types exactly YES.
+kernel_fix() {
+  local cur new_ver ans i
+  local -a cloud_pkgs
+  cur="$(uname -r)"
+
+  if [ "$(dpkg --print-architecture 2>/dev/null)" != "amd64" ] || ! command -v update-grub >/dev/null 2>&1; then
+    kfix_manual_message
+    exit 1
+  fi
+  if ! kfix_have_tty; then
+    echo "ERROR: PPP is disabled in this cloud kernel ($cur), and the fix needs you to" >&2
+    echo "confirm it at a terminal. Nothing was changed. Run the installer from an" >&2
+    echo "interactive SSH session (not piped into bash, not from cron) and answer there." >&2
+    exit 1
+  fi
+
+  echo
+  echo "PPP is DISABLED in the running kernel ($cur)."
+  echo "This is a Debian cloud kernel. No package, mknod or modprobe can fix that."
+  echo "The fix is to replace it with the stock Debian kernel (linux-image-amd64)."
+  echo
+  echo "If you continue, this installer will, in this order:"
+  echo "  1. install linux-image-amd64 (the stock Debian kernel)"
+  echo "  2. REMOVE the cloud kernel(s): linux-image-*-cloud-amd64"
+  echo "  3. run update-grub"
+  echo "  4. reboot this server (5-second countdown)"
+  echo
+  kfix_red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  kfix_red "WARNING: THIS CANNOT BE UNDONE."
+  kfix_red "THE CLOUD KERNEL WILL BE REMOVED FROM THIS SERVER."
+  kfix_red "IF THE STOCK KERNEL FAILS TO BOOT, YOU WILL LOSE SSH ACCESS."
+  kfix_red "CHECK THAT YOUR PROVIDER GIVES YOU CONSOLE ACCESS (VNC, SERIAL OR RESCUE)"
+  kfix_red "BEFORE YOU CONTINUE, AND TAKE A SNAPSHOT FIRST IF THIS IS A REAL SERVER."
+  kfix_red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo
+  printf 'Type YES (capital letters, exactly) to continue. Anything else cancels and changes nothing: '
+  ans="$(kfix_read_answer)"
+  echo
+  if [ "$ans" != "YES" ]; then
+    echo "Cancelled. Nothing was changed."
+    exit 1
+  fi
+
+  echo "Installing the stock Debian kernel (linux-image-amd64)..."
+  apt-get update || echo "WARNING: apt-get update reported errors; continuing."
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-amd64; then
+    echo "ERROR: could not install linux-image-amd64. The cloud kernel was NOT removed" >&2
+    echo "and nothing else was changed. Fix the apt error above and re-run." >&2
+    exit 1
+  fi
+
+  # Prove the new kernel is really there, and has PPP, BEFORE the cloud
+  # kernel is removed. If this fails the machine is still bootable as before.
+  new_ver="$(kfix_stock_versions | tail -n 1)"
+  if [ -z "$new_ver" ] \
+    || [ ! -e "$KFIX_BOOT_DIR/vmlinuz-$new_ver" ] \
+    || [ ! -e "$KFIX_BOOT_DIR/initrd.img-$new_ver" ] \
+    || ! grep -Eq '^CONFIG_PPP=[ym]' "$KFIX_BOOT_DIR/config-$new_ver" 2>/dev/null; then
+    echo "ERROR: the stock kernel did not install cleanly (no usable PPP-enabled kernel" >&2
+    echo "found in $KFIX_BOOT_DIR). The cloud kernel was NOT removed. Look at the apt output" >&2
+    echo "above, fix it, and re-run." >&2
+    exit 1
+  fi
+  echo "Stock kernel ready: $new_ver"
+
+  mapfile -t cloud_pkgs < <(kfix_cloud_pkgs)
+  if [ "${#cloud_pkgs[@]}" -gt 0 ]; then
+    echo "Removing the cloud kernel: ${cloud_pkgs[*]}"
+    # With DEBIAN_FRONTEND=noninteractive Debian's prerm lets the running
+    # kernel be removed without a prompt (we reboot right after).
+    if ! DEBIAN_FRONTEND=noninteractive apt-get remove -y "${cloud_pkgs[@]}"; then
+      echo "ERROR: could not remove the cloud kernel. Do NOT reboot yet." >&2
+      echo "Remove it by hand, then run update-grub and reboot:" >&2
+      echo "  apt-get remove ${cloud_pkgs[*]}" >&2
+      exit 1
+    fi
+  fi
+  if [ -n "$(kfix_cloud_pkgs)" ]; then
+    echo "ERROR: a cloud kernel package is still installed. Do NOT reboot yet." >&2
+    echo "Remove it by hand, then run update-grub and reboot." >&2
+    exit 1
+  fi
+
+  echo "Updating GRUB..."
+  if ! update-grub; then
+    echo "ERROR: update-grub failed. Do NOT reboot until it succeeds:" >&2
+    echo "  update-grub" >&2
+    exit 1
+  fi
+  if ! grep -qF "vmlinuz-$new_ver" "$KFIX_GRUB_CFG" 2>/dev/null; then
+    echo "ERROR: $KFIX_GRUB_CFG does not list the new kernel ($new_ver). Do NOT reboot" >&2
+    echo "until GRUB is fixed (run update-grub and check the file)." >&2
+    exit 1
+  fi
+
+  # Remember that the fix ran, so a re-run can tell "now fixed" from "still
+  # a cloud kernel" and never loops through the fix again.
+  if ! { mkdir -p "$KFIX_STATE_DIR" \
+    && printf 'boot_id=%s\nfrom_kernel=%s\nto_kernel=%s\n' "$(kfix_boot_id)" "$cur" "$new_ver" > "$KFIX_STATE_FILE"; }; then
+    echo "ERROR: could not write $KFIX_STATE_FILE. Reboot by hand when ready." >&2
+    exit 1
+  fi
+
+  echo
+  echo "Kernel fix done. The installation itself has NOT started yet."
+  echo "AFTER THE REBOOT: wait about a minute, log in by SSH again, and RE-RUN THIS"
+  echo "INSTALLER (the same command you used to start it)."
+  echo
+  i=5
+  while [ "$i" -ge 1 ]; do
+    echo "Rebooting in $i..."
+    sleep 1
+    i=$((i - 1))
+  done
+  echo "Rebooting now."
+  if ! reboot; then
+    echo "ERROR: the reboot command failed. Reboot by hand, then re-run the installer." >&2
+    exit 1
+  fi
+  exit 0
+}
+
+# Returns 0 only when PPP works on the running kernel. Every other path
+# either exits or hands over to kernel_fix. It never loops: a second
+# visit after the fix aborts instead of offering the fix again.
+ensure_ppp() {
+  local state_boot_id
+  echo "Checking PPP kernel support..."
+  if ppp_ready; then
+    if [ -f "$KFIX_STATE_FILE" ]; then
+      rm -f "$KFIX_STATE_FILE"
+      echo "Kernel fix from the earlier run worked: now running $(uname -r)."
+    fi
+    echo "PPP kernel support: OK (kernel $(uname -r))"
+    return 0
+  fi
+
+  if [ -f "$KFIX_STATE_FILE" ]; then
+    state_boot_id="$(awk -F= '$1 == "boot_id" { print $2; exit }' "$KFIX_STATE_FILE" 2>/dev/null)"
+    if [ "$state_boot_id" = "$(kfix_boot_id)" ]; then
+      echo "ERROR: the kernel fix was already applied, but this server has not been" >&2
+      echo "rebooted since (still running $(uname -r)). Reboot it:  reboot" >&2
+      echo "then log in again and re-run this installer." >&2
+      exit 1
+    fi
+    if kfix_is_cloud_kernel; then
+      echo "ERROR: this VPS cannot run L2TP." >&2
+      echo "The stock kernel was installed and the server was rebooted, but it came back" >&2
+      echo "on a cloud kernel ($(uname -r)) without PPP. The provider is booting its own" >&2
+      echo "kernel instead of the one in /boot (look for a kernel / boot setting in the" >&2
+      echo "provider's control panel), or this VPS type cannot use a custom kernel." >&2
+      echo "Use a different VPS image/plan. Not trying again, to avoid a reboot loop." >&2
+      echo "(To allow one more attempt on purpose, delete $KFIX_STATE_FILE.)" >&2
+      exit 1
+    fi
+  fi
+
+  if kfix_is_cloud_kernel && kfix_kernel_lacks_ppp; then
+    kernel_fix # always exits: reboot on success, an error otherwise
+  fi
+
+  if grep -q '^# CONFIG_PPP is not set' "$KFIX_BOOT_DIR/config-$(uname -r)" 2>/dev/null; then
+    kfix_manual_message
   else
     echo "ERROR: PPP is not usable on kernel $(uname -r):" >&2
     echo "the modules ppp_generic, ppp_async, l2tp_ppp did not all load," >&2
@@ -127,9 +360,18 @@ PPPMSG
     echo "'modprobe ppp_generic' and the kernel config, then re-run." >&2
   fi
   exit 1
-fi
+}
+# END kernel-fix
+
+ensure_ppp
 printf 'ppp_generic\nppp_async\nl2tp_ppp\n' > /etc/modules-load.d/l2tp.conf
-echo "PPP kernel support: OK (kernel $(uname -r))"
+
+# Minimal tools: openssl for secret generation and curl for the server-IP
+# lookup. Only now, after the PPP check has passed.
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y openssl curl >/dev/null 2>&1 || true
+command -v openssl >/dev/null 2>&1 || die "openssl is required but could not be installed."
+command -v curl >/dev/null 2>&1 || die "curl is required but could not be installed."
 
 # --- Secrets: env override > existing install > generated ---
 # Reusing existing values on re-install is what keeps existing
@@ -624,13 +866,16 @@ UNIT
 
 cat > /usr/local/bin/l2tp-user <<'USER_SCRIPT'
 #!/bin/bash
+# easyl2tp-api: usage-v1
+# ezl2tp looks for the line above before it runs "l2tp-user usage". A copy
+# of l2tp-user without it would take "usage" for a new username.
 set -eu
 
 ACT="${1:-list}"
 USR="${2:-}"
 PAS="${3:-}"
 
-if [ -n "$ACT" ] && [ "$ACT" != "add" ] && [ "$ACT" != "del" ] && [ "$ACT" != "list" ] && [ "$ACT" != "stats" ] && [ "$ACT" != "reset" ] && [ "$ACT" != "logs" ]; then
+if [ -n "$ACT" ] && [ "$ACT" != "add" ] && [ "$ACT" != "del" ] && [ "$ACT" != "list" ] && [ "$ACT" != "stats" ] && [ "$ACT" != "reset" ] && [ "$ACT" != "logs" ] && [ "$ACT" != "usage" ]; then
   PAS="${2:-}"
   USR="$ACT"
   ACT="add"
@@ -652,13 +897,29 @@ if [ "$ACT" = "add" ] && [ -n "$PAS" ]; then
   fi
 fi
 
-# The server IP is what the installer wrote into ipsec.conf (no network call).
-SERVER_IP=$(awk -F= '/^[[:space:]]*leftid=/ && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $2; exit}' /etc/ipsec.conf 2>/dev/null || true)
-[ -n "$SERVER_IP" ] || SERVER_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo unknown)
-MASTER_PSK=$(awk -F'"' '/^: PSK/ {print $2; exit}' /etc/ipsec.secrets)
-TUN_PASS=$(awk '{print $3; exit}' /etc/xl2tpd/l2tp-secrets)
+# Where the live data comes from. Online status comes ONLY from the session
+# files that the ppp and IPsec hooks write: pppN (L2TP) and ikev2_<VIP>.
+CHAP="/etc/ppp/chap-secrets"
+SESS_DIR="/run/vpn-sessions"
+NET_DIR="/sys/class/net"
 DB="/var/log/vpn-usage/totals.db"
 touch "$DB"
+
+SERVER_IP=""
+MASTER_PSK=""
+TUN_PASS=""
+# Only the commands that print or rebuild secrets need these. stats, usage,
+# logs and reset must work, and stay fast, without them.
+load_server_info() {
+  # The server IP is what the installer wrote into ipsec.conf (no network call).
+  SERVER_IP=$(awk -F= '/^[[:space:]]*leftid=/ && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $2; exit}' /etc/ipsec.conf 2>/dev/null || true)
+  [ -n "$SERVER_IP" ] || SERVER_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo unknown)
+  MASTER_PSK=$(awk -F'"' '/^: PSK/ {print $2; exit}' /etc/ipsec.secrets)
+  TUN_PASS=$(awk '{print $3; exit}' /etc/xl2tpd/l2tp-secrets)
+}
+case "$ACT" in
+  add | del | list) load_server_info ;;
+esac
 
 rebuild_ipsec_secrets() {
   : > /etc/ipsec.secrets
@@ -676,28 +937,52 @@ EOF
   chmod 600 /etc/ipsec.secrets
 }
 
-show_stats() {
-  TMP_LIVE=$(mktemp)
+# One row per user:  <user> <upload_bytes> <download_bytes> <sessions>
+#   bytes    = totals.db (sessions that already ended)
+#              + live counters of the sessions that are open right now
+#   sessions = IKEv2(<vip>) and L2TP(<pppN>), comma-separated, or "-" if offline
+# This is the single place that decides who is online and how much they used,
+# so stats, list, usage and the ezl2tp panel can never disagree.
+#
+# No double counting: totals.db is only written when a session ends, at the
+# same moment its session file, ppp device and iptables rules go away, and
+# live bytes are only read for sessions that still have a session file.
+usage_rows() {
+  local facts f dev u peer rx tx rc=0
+  facts=$(mktemp)
 
-  for devpath in /sys/class/net/ppp*; do
-    [ -e "$devpath" ] || continue
-    dev=$(basename "$devpath")
-    u=""
-    if [ -f "/run/vpn-sessions/$dev" ]; then
-      u=$(awk '{print $1}' "/run/vpn-sessions/$dev" | tr -d '"')
-    fi
-    if [ -z "$u" ]; then
-      pip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/peer/ {sub(/\/.*/, "", $4); print $4; exit}')
-      u="L2TP_${pip:-$dev}"
-    fi
-    rx=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null || echo 0)
-    tx=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null || echo 0)
-    echo "$u $rx $tx L2TP($dev)" >> "$TMP_LIVE"
+  # T = bytes of finished sessions, U = every user, so offline users get a row.
+  awk 'NF >= 3 && $1 != "" { print "T", $1, $2, $3 }' "$DB" >> "$facts" 2>/dev/null || true
+  awk '!/^#/ && NF >= 3 { u = $1; gsub(/"/, "", u); if (u != "") print "U", u }' "$CHAP" >> "$facts" 2>/dev/null || true
+
+  # F = session files: "pppN" (L2TP) or "ikev2_<VIP>" (IKEv2), content "<user> <peer>".
+  if [ -d "$SESS_DIR" ]; then
+    for f in "$SESS_DIR"/*; do
+      [ -f "$f" ] || continue
+      u=""
+      peer=""
+      read -r u peer < "$f" || true
+      u=$(printf '%s' "$u" | tr -d '"')
+      echo "F $(basename "$f") ${u:-unknown} ${peer:--}" >> "$facts"
+    done
+  fi
+
+  # D = live counters of every ppp interface (L2TP). rx = from the client.
+  for f in "$NET_DIR"/ppp*; do
+    [ -e "$f" ] || continue
+    dev=$(basename "$f")
+    rx=$(cat "$f/statistics/rx_bytes" 2>/dev/null || echo 0)
+    tx=$(cat "$f/statistics/tx_bytes" 2>/dev/null || echo 0)
+    peer=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/peer/ { sub(/\/.*/, "", $4); print $4; exit }')
+    echo "D $dev $rx $tx ${peer:--}" >> "$facts"
   done
 
-  ipsec statusall 2>/dev/null | awk '
+  # S = IKEv2 child SAs as strongSwan reports them. The user is the id in
+  # brackets after the "..." on the ESTABLISHED line; bytes_i = from the client.
+  ipsec statusall 2>/dev/null | gawk '
     /ikev2-psk\[[0-9]+\]: ESTABLISHED/ {
-      if (match($0, /\.\.\.[^ ]\+\[([^\]]+)\]/, m)) {
+      cur_user = ""
+      if (match($0, /\.\.\.[^ ]+\[([^\]]+)\]/, m)) {
         cur_user = m[1]
         gsub(/"/, "", cur_user)
       }
@@ -709,57 +994,91 @@ show_stats() {
     }
     /ikev2-psk\{[0-9]+\}:.*=== 10\.99\.1\./ {
       if (match($0, /=== (10\.99\.1\.[0-9]+)/, vip)) {
-        if (cur_user != "") {
-          print cur_user, rx+0, tx+0, "IKEv2(" vip[1] ")"
-        }
+        print "S", vip[1], (cur_user != "" ? cur_user : "-"), rx + 0, tx + 0
+        rx = 0; tx = 0
       }
     }
-  ' >> "$TMP_LIVE"
+  ' >> "$facts" || true
 
+  # I = iptables FORWARD counters per VIP (IKEV2_UP_* = from the client,
+  # IKEV2_DOWN_* = to the client). They keep counting across IKEv2 child SA
+  # rekeys, which statusall does not. The top-most rule is the live one.
+  iptables -w -nvxL FORWARD 2>/dev/null | awk '
+    /IKEV2_UP_/ && $8 ~ /^10\.99\.1\.[0-9]+$/ { if (!($8 in up)) up[$8] = $2; seen[$8] = 1 }
+    /IKEV2_DOWN_/ && $9 ~ /^10\.99\.1\.[0-9]+$/ { if (!($9 in down)) down[$9] = $2; seen[$9] = 1 }
+    END { for (v in seen) print "I", v, (v in up ? up[v] : 0), (v in down ? down[v] : 0) }
+  ' >> "$facts" || true
+
+  awk '
+    function max(a, b) { a += 0; b += 0; return (a > b) ? a : b }
+    function addsess(user, label, rx, tx) {
+      users[user] = 1
+      r[user] += rx
+      t[user] += tx
+      st[user] = (st[user] == "" ? label : st[user] "," label)
+    }
+    $1 == "T" { users[$2] = 1; r[$2] += $3; t[$2] += $4 }
+    $1 == "U" { users[$2] = 1 }
+    $1 == "F" { nf++; fname[nf] = $2; fuser[nf] = $3; fpeer[nf] = $4 }
+    $1 == "D" { hasdev[$2] = 1; drx[$2] = $3; dtx[$2] = $4; dpeer[$2] = $5 }
+    $1 == "S" { ns++; svip[ns] = $2; suser[ns] = $3; srx[$2] = max(srx[$2], $4); stx[$2] = max(stx[$2], $5) }
+    $1 == "I" { irx[$2] = $3; itx[$2] = $4 }
+    END {
+      # Registered sessions. A session file means ONLINE, whatever else says.
+      # The counters are 0 when the device or rule is already gone.
+      for (i = 1; i <= nf; i++) {
+        name = fname[i]
+        u = fuser[i]
+        if (name ~ /^ppp[0-9]+$/) {
+          claimed_dev[name] = 1
+          if (name in hasdev) addsess(u, "L2TP(" name ")", drx[name], dtx[name])
+          else addsess(u, "L2TP(" name ")", 0, 0)
+        } else if (name ~ /^ikev2_/) {
+          vip = fpeer[i]
+          if (vip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) vip = substr(name, 7)
+          claimed_vip[vip] = 1
+          addsess(u, "IKEv2(" vip ")", max(srx[vip], irx[vip]), max(stx[vip], itx[vip]))
+        } else {
+          addsess(u, name, 0, 0)
+        }
+      }
+      # Sessions the kernel or strongSwan show but no hook registered.
+      for (dev in hasdev) {
+        if (dev in claimed_dev) continue
+        addsess("L2TP_" (dpeer[dev] == "-" ? dev : dpeer[dev]), "L2TP(" dev ")", drx[dev], dtx[dev])
+      }
+      for (i = 1; i <= ns; i++) {
+        vip = svip[i]
+        if (vip in claimed_vip) continue
+        claimed_vip[vip] = 1
+        addsess((suser[i] == "-" ? "IKEv2_" vip : suser[i]), "IKEv2(" vip ")", max(srx[vip], irx[vip]), max(stx[vip], itx[vip]))
+      }
+      for (u in users) printf "%s %.0f %.0f %s\n", u, r[u], t[u], (st[u] == "" ? "-" : st[u])
+    }
+  ' "$facts" | LC_ALL=C sort || rc=$?
+  rm -f "$facts"
+  return "$rc"
+}
+
+show_stats() {
   echo "--------------------------------------------------------------------------------"
   printf "%-16s | %-12s | %-12s | %-12s | %-18s\n" "USERNAME" "UPLOAD" "DOWNLOAD" "TOTAL USED" "STATUS"
   echo "--------------------------------------------------------------------------------"
-
-  awk -v db="$DB" -v live="$TMP_LIVE" '
+  usage_rows | awk '
     function human(x) {
       split("B KB MB GB TB", v, " ")
-      s=1
+      s = 1
       while (x >= 1024 && s < 5) { x /= 1024; s++ }
       return sprintf("%.2f %s", x, v[s])
     }
-    BEGIN {
-      while ((getline < db) > 0) {
-        if ($1 != "") {
-          rx[$1] += $2
-          tx[$1] += $3
-          users[$1] = 1
-        }
-      }
-      while ((getline < live) > 0) {
-        if ($1 != "") {
-          rx[$1] += $2
-          tx[$1] += $3
-          status[$1] = (status[$1] ? status[$1] ", " $4 : $4)
-          users[$1] = 1
-        }
-      }
+    {
+      st = $4
+      if (st == "-") st = "offline"
+      else { gsub(/,/, ", ", st); st = "ONLINE: " st }
+      printf "%-16s | %-12s | %-12s | %-12s | %-18s\n", $1, human($2), human($3), human($2 + $3), st
     }
-    !/^#/ && NF >= 3 {
-      u = $1; gsub(/"/, "", u)
-      users[u] = 1
-    }
-    END {
-      for (u in users) {
-        r = rx[u] + 0
-        t = tx[u] + 0
-        tot = r + t
-        st = (status[u] ? "ONLINE: " status[u] : "offline")
-        printf "%-16s | %-12s | %-12s | %-12s | %-18s\n", u, human(r), human(t), human(tot), st
-      }
-    }
-  ' /etc/ppp/chap-secrets | sort
+  '
   echo "--------------------------------------------------------------------------------"
-  rm -f "$TMP_LIVE"
 }
 
 if [ "$ACT" = "add" ]; then
@@ -804,6 +1123,8 @@ elif [ "$ACT" = "logs" ]; then
   fi
 elif [ "$ACT" = "stats" ]; then
   show_stats
+elif [ "$ACT" = "usage" ]; then
+  usage_rows
 else
   echo "================================================================================"
   echo "Server IP: $SERVER_IP   (secrets are shown only on a user card: ezl2tp card <user>)"
