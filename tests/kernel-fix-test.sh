@@ -9,7 +9,7 @@
 # Usage: bash tests/kernel-fix-test.sh   (from anywhere)
 # The stubs below are called by the sourced install.sh code, and the KFIX_*
 # variables are read by it; shellcheck cannot see either.
-# shellcheck disable=SC2317,SC2034
+# shellcheck disable=SC2317,SC2034,SC2329
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
@@ -201,6 +201,15 @@ countdown="$(grep -o 'Rebooting in [0-9]' "$D/out" | tr -d 'A-Za-z ' | tr '\n' '
 expect "YES: countdown is 5-4-3-2-1" test "$countdown" = "5-4-3-2-1-"
 expect "YES: sleeps 5 times (one per count)" test "$(grep -c '^sleep 1$' "$D/calls")" -eq 5
 expect "YES: tells the user to re-run the installer after the reboot" has_out "RE-RUN THIS"
+# The re-run reminder must be the LAST line before the countdown (the SSH
+# session dies on the reboot), word for word.
+RERUN_LINE="IMPORTANT: AFTER THE REBOOT, START THE SCRIPT AGAIN: bash ./install.sh"
+expect "YES: re-run reminder is printed word for word" has_out "$RERUN_LINE"
+expect "YES: re-run reminder is printed exactly once" test "$(grep -cxF "$RERUN_LINE" "$D/out")" -eq 1
+first_count_line="$(grep -n '^Rebooting in 5' "$D/out" | head -n 1 | cut -d: -f1)"
+expect "YES: the countdown starts with 'Rebooting in 5...'" test -n "$first_count_line"
+expect "YES: the re-run reminder is the very last line before the countdown" \
+  test "$(sed -n "$((first_count_line - 1))p" "$D/out")" = "$RERUN_LINE"
 expect "YES: installation does NOT continue after the reboot call" no_out "RETURNED"
 expect "YES: exit status 0 after scheduling the reboot" test "$RC" -eq 0
 expect "YES: marker records the boot id" grep -qx 'boot_id=boot-1' "$D/state/kernel-fix"

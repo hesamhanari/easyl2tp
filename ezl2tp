@@ -15,6 +15,8 @@
 #                     ezl2tp add <user> [password]
 #                     ezl2tp del <user>
 #                     ezl2tp card <user>
+#                     ezl2tp limit <user> <GB>      (data limit, e.g. 50 or 12.5)
+#                     ezl2tp limit <user> clear     (unlimited)
 #                     ezl2tp restart
 #
 # Data sources (overridable with EZL2TP_* env vars, for testing only):
@@ -29,6 +31,11 @@
 # rows feed "l2tp-user stats", so the two can never disagree. If l2tp-user
 # is an older copy without that command, the panel falls back to the saved
 # totals plus the session files (no live bytes) and never calls it.
+#
+# Data limits are kept and enforced by l2tp-user ("l2tp-user limits" rows:
+# limit, used, period, BLOCKED state). The panel only shows them and passes
+# "ezl2tp limit" on, so the panel and the CLI always agree. A user with no
+# limit shows as "unlimited" and is never blocked.
 
 set -u
 
@@ -111,21 +118,69 @@ user_pass() {
 USAGE_ROWS=""
 USAGE_LIVE=0
 
+# Rows "<user> <limit> <used> <start> <end> <state> <sessions>" from
+# "l2tp-user limits": one per user that HAS a limit (state: pending, ok,
+# BLOCKED, expired). Users without a row are unlimited.
+LIMIT_ROWS=""
+
 # Older l2tp-user copies treat any unknown word as a NEW USERNAME to add, so
-# "usage" is only sent to a copy that carries this marker line.
+# "usage" and "limit" are only sent to a copy that carries these marker lines.
 l2tp_user_has_usage() {
   [ -x "$L2TP_USER" ] && grep -q '^# easyl2tp-api: usage-v1$' "$L2TP_USER" 2>/dev/null
+}
+l2tp_user_has_limits() {
+  [ -x "$L2TP_USER" ] && grep -q '^# easyl2tp-api: limits-v1$' "$L2TP_USER" 2>/dev/null
 }
 
 # Refresh the rows. Call at the start of every screen that shows usage.
 load_usage() {
   USAGE_ROWS=""
   USAGE_LIVE=0
+  LIMIT_ROWS=""
   if l2tp_user_has_usage && USAGE_ROWS="$("$L2TP_USER" usage 2>/dev/null)"; then
     USAGE_LIVE=1
   else
     USAGE_ROWS=""
   fi
+  if l2tp_user_has_limits; then
+    LIMIT_ROWS="$("$L2TP_USER" limits 2>/dev/null || true)"
+  fi
+}
+
+# Prints the limit row of one user, or nothing when the user is unlimited.
+user_limit_row() {
+  printf '%s\n' "$LIMIT_ROWS" | awk -v u="$1" '$1 == u { print; exit }'
+}
+
+# Epoch seconds -> date (UTC); with $2 = time, date and time.
+fmt_epoch() {
+  if [ "${2:-}" = time ]; then
+    date -u -d "@$1" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "-"
+  else
+    date -u -d "@$1" '+%Y-%m-%d' 2>/dev/null || echo "-"
+  fi
+}
+
+# One line: used / limit / left / period of a limited user, prefixed by $1.
+# Prints nothing for an unlimited user.
+describe_limit() {
+  local ind="$1" row lim used end state left
+  row="$(user_limit_row "$2")"
+  [ -n "$row" ] || return 0
+  read -r _ lim used _ end state _ <<EOF
+$row
+EOF
+  left=$((lim - used)); [ "$left" -lt 0 ] && left=0
+  case "$state" in
+    pending)
+      printf '%sused %s of %s, left %s - the 30-day period starts at the first connection\n' "$ind" "$(human "$used")" "$(human "$lim")" "$(human "$left")" ;;
+    expired)
+      printf '%sused %s of %s - period ended %s, the next connection starts a fresh one\n' "$ind" "$(human "$used")" "$(human "$lim")" "$(fmt_epoch "$end")" ;;
+    BLOCKED)
+      printf '%sBLOCKED: used %s of %s, left %s - blocked until the period ends %s\n' "$ind" "$(human "$used")" "$(human "$lim")" "$(human "$left")" "$(fmt_epoch "$end" time)" ;;
+    *)
+      printf '%sused %s of %s, left %s, period ends %s\n' "$ind" "$(human "$used")" "$(human "$lim")" "$(human "$left")" "$(fmt_epoch "$end" time)" ;;
+  esac
 }
 
 user_totals() {
@@ -240,23 +295,33 @@ EOF
 }
 
 show_users() {
-  local u rx tx sess status
+  local u rx tx sess status lrow lstate lim lcol
   load_usage
-  echo "=================================================="
-  printf "%-16s %-9s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL"
-  echo "--------------------------------------------------"
+  echo "=============================================================================="
+  printf "%-16s %-9s %-12s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL" "LIMIT"
+  echo "------------------------------------------------------------------------------"
   while IFS= read -r u; do
     [ -n "$u" ] || continue
     read -r rx tx sess <<EOF
 $(user_usage "$u")
 EOF
     if [ "$sess" != "-" ]; then status="ONLINE"; else status="offline"; fi
-    printf "%-16s %-9s %-12s %-12s %-12s\n" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))"
+    lrow="$(user_limit_row "$u")"
+    lcol="unlimited"
+    if [ -n "$lrow" ]; then
+      lim="$(printf '%s' "$lrow" | awk '{ print $2 }')"
+      lstate="$(printf '%s' "$lrow" | awk '{ print $6 }')"
+      lcol="$(human "$lim")"
+      if [ "$lstate" = "BLOCKED" ]; then status="BLOCKED"; fi
+    fi
+    printf "%-16s %-9s %-12s %-12s %-12s %-12s\n" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))" "$lcol"
+    if [ -n "$lrow" ]; then describe_limit "    -> " "$u"; fi
   done <<EOF
 $(list_users)
 EOF
-  echo "=================================================="
+  echo "=============================================================================="
   echo "(Passwords are NOT shown here. Use 'card <user>' for one user's card.)"
+  echo "(LIMIT: 'ezl2tp limit <user> <GB>' sets one, 'ezl2tp limit <user> clear' removes it.)"
 }
 
 show_live() {
@@ -349,10 +414,42 @@ do_del() {
   "$L2TP_USER" del "$user"
 }
 
+# The data-limit block of a card: limit, used, remaining, period end, status.
+card_limit() {
+  local user="$1" row lim used end state left rx tx sess
+  row="$(user_limit_row "$user")"
+  if [ -z "$row" ]; then
+    read -r rx tx sess <<EOF
+$(user_usage "$user")
+EOF
+    printf "Data limit:               unlimited\n"
+    printf "Used:                     %s\n" "$(human $((rx + tx)))"
+    return 0
+  fi
+  read -r _ lim used _ end state _ <<EOF
+$row
+EOF
+  left=$((lim - used)); [ "$left" -lt 0 ] && left=0
+  printf "Data limit:               %s per 30 days (upload + download)\n" "$(human "$lim")"
+  printf "Used:                     %s\n" "$(human "$used")"
+  printf "Remaining:                %s\n" "$(human "$left")"
+  case "$state" in
+    pending) printf "Period:                   starts at the first connection\n" ;;
+    expired) printf "Period:                   ended %s, a fresh one starts at the next connection\n" "$(fmt_epoch "$end" time)" ;;
+    *) printf "Period ends:              %s\n" "$(fmt_epoch "$end" time)" ;;
+  esac
+  if [ "$state" = "BLOCKED" ]; then
+    printf "Status:                   BLOCKED (over the limit until the period ends)\n"
+  else
+    printf "Status:                   OK\n"
+  fi
+}
+
 show_card() {
   local user="$1" pass mp tp
   pass="$(user_pass "$user")"
   if [ -z "$pass" ]; then echo "User '$user' not found in $CHAP"; return 1; fi
+  load_usage
   mp="$(master_psk)"; tp="$(tun_pass)"
   echo "=========================================="
   echo "  Card for: $user"
@@ -361,6 +458,8 @@ show_card() {
   printf "Server IP:                %s\n" "$(server_ip)"
   printf "Username:                 %s\n" "$user"
   printf "Password:                 %s\n" "$pass"
+  echo "------------------------------------------"
+  card_limit "$user"
   echo "------------------------------------------"
   echo "Modem — plain L2TP (no IPsec):"
   printf "  LNS address:            %s\n" "$(server_ip)"
@@ -384,6 +483,18 @@ show_card() {
   echo "=========================================="
 }
 
+# ezl2tp limit <user> <GB|clear>: l2tp-user keeps and enforces the limit.
+do_limit() {
+  local user="$1" val="$2"
+  require_l2tp_user || return 1
+  if ! l2tp_user_has_limits; then
+    echo "ERROR: the installed $L2TP_USER does not know data limits yet."
+    echo "Update it by running the easyl2tp install.sh again (your users are kept)."
+    return 1
+  fi
+  "$L2TP_USER" limit "$user" "$val"
+}
+
 do_restart() {
   echo "Restarting strongswan-starter, xl2tpd, l2tp-firewall..."
   systemctl restart strongswan-starter xl2tpd l2tp-firewall 2>&1
@@ -397,10 +508,12 @@ pause() {
 }
 
 usage() {
-  echo "Usage: ezl2tp [status|users|stats|live|logs|add|del|card|restart|help]"
+  echo "Usage: ezl2tp [status|users|stats|live|logs|add|del|card|limit|restart|help]"
   echo "  No argument: interactive menu."
   echo "  add <user> [password]   (empty password = random)"
   echo "  del <user>   card <user>"
+  echo "  limit <user> <GB>       data limit per 30 days, upload + download (50 or 12.5)"
+  echo "  limit <user> clear      unlimited"
 }
 
 # --- non-interactive mode ---
@@ -425,6 +538,14 @@ if [ "${1:-}" != "" ]; then
     card)
       if [ -z "${2:-}" ]; then echo "Usage: ezl2tp card <user>"; exit 1; fi
       show_card "$2"
+      ;;
+    limit)
+      if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+        echo "Usage: ezl2tp limit <user> <GB>     (decimals allowed: 50 or 12.5)"
+        echo "       ezl2tp limit <user> clear   (unlimited)"
+        exit 1
+      fi
+      do_limit "$2" "$3"
       ;;
     help|--help|-h) usage ;;
     *) echo "Unknown command: $1"; usage; exit 1 ;;
@@ -457,6 +578,7 @@ while true; do
   echo "  7) Delete user"
   echo "  8) Show user card (for sharing)"
   echo "  9) Restart VPN services"
+  echo " 10) Set or clear a user's data limit"
   echo "  0) Exit"
   echo "--------------------------------------------------"
   printf "Choice: "
@@ -487,6 +609,14 @@ while true; do
       pause
       ;;
     9) do_restart; pause ;;
+    10)
+      if pick_user; then
+        printf "Limit for %s in GB (50 or 12.5; the word clear = unlimited): " "$SELECTED_USER"
+        read -r nl
+        do_limit "$SELECTED_USER" "$nl"
+      fi
+      pause
+      ;;
     0) echo "Bye."; exit 0 ;;
     *) echo "Invalid choice."; sleep 1 ;;
   esac
