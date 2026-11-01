@@ -47,8 +47,9 @@ will not work anonymously. Until it goes public, clone the repo
 checkout, or copy `install.sh` to the server and run it there.
 
 What the installer does, in order:
-1. Checks root and Debian 13.
-2. Checks PPP kernel support FIRST, before stopping anything.
+1. Checks root, Debian 13 (other versions are refused) and a public IPv4.
+2. Checks PPP kernel support FIRST (modules load and `/dev/ppp` opens),
+   before stopping anything.
    If PPP is disabled in the kernel (some Debian cloud kernels),
    it stops with a clear message instead of installing a broken
    server. Fix that kernel first, then re-run.
@@ -61,8 +62,9 @@ What the installer does, in order:
 5. Installs strongswan-starter (L2TP/IPsec IKEv1 + IKEv2),
    xl2tpd, firewall/NAT, usage tracking, `l2tp-user`, and
    `ezl2tp` if it can find it.
-6. Prints the server IP and the two secrets at the end, on the
-   server terminal only. Save them — do not share them publicly.
+6. Prints only the next steps at the end. The secrets are NOT printed:
+   they live in root-only files on the server, and each user's card
+   (`ezl2tp card <user>`) shows what that user needs.
 
 Re-running the installer is safe for users: it reuses existing
 secrets and preserves existing users in chap-secrets.
@@ -81,6 +83,10 @@ secrets and preserves existing users in chap-secrets.
 - `AGENTS.md` — the multi-agent workflow for this project.
 - `SECURITY.md` — what must never go into this repo.
 - `tests/smoke-test.sh` — fake-data smoke test for the panel.
+- `tests/lint.sh` — shellcheck (including the scripts embedded in
+  `install.sh`) and guards for settings that must not come back.
+- `tests/fresh-vps-test.md` — how to test the installer on a fresh
+  Debian 13 VPS (done by hand, on a throwaway server).
 
 ## Using the panel on an existing server (advanced users only)
 

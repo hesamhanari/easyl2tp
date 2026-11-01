@@ -2,7 +2,7 @@
 # easyl2tp — one-line installer for an L2TP + IKEv2 VPN server
 # with a terminal panel, for Debian 13.
 #
-# Based on the tested Gemini Argon script that runs on mehr23.
+# Based on a tested, working Gemini-generated L2TP/IKEv2 script.
 # Differences from that original, on purpose:
 #  - NO hardcoded passwords or PSKs. Secrets are generated here
 #    with openssl rand, unless you pass them in the environment
@@ -16,6 +16,11 @@
 #    ship with PPP disabled entirely — see the error message).
 #  - Existing configs are backed up to /root/easyl2tp-backup-*
 #    before they are overwritten.
+#  - Reviewed against SPEC.md (PR 1): the IKEv1 aggressive-mode PSK
+#    flag is gone, xl2tpd requires PPP authentication itself, the
+#    firewall no longer flips the global FORWARD policy or opens the
+#    whole server to VPN clients, and secrets are no longer printed
+#    at the end of the install.
 #
 # Usage (after this repo is public, or from a local copy):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/hesamhanari/easyl2tp/main/install.sh)
@@ -50,6 +55,7 @@
 # IKEv2 can use a per-user PSK (the user's PPP password).
 #
 set -u
+umask 077
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -59,12 +65,13 @@ fi
 
 # --- OS check: tested on Debian 13 only ---
 if [ -f /etc/os-release ]; then
+  # shellcheck disable=SC1091
   . /etc/os-release
   if [ "${ID:-}" != "debian" ]; then
     die "This installer is tested on Debian 13 only (found ID=${ID:-unknown})."
   fi
   if [ "${VERSION_ID:-}" != "13" ]; then
-    echo "WARNING: tested on Debian 13, found Debian ${VERSION_ID:-unknown}. Continuing anyway."
+    die "This installer is tested on Debian 13 only (found Debian ${VERSION_ID:-unknown})."
   fi
 else
   die "Cannot detect the OS (/etc/os-release missing)."
@@ -85,17 +92,20 @@ command -v curl >/dev/null 2>&1 || die "curl is required but could not be instal
 # would leave a server that accepts L2TP tunnels and then kills
 # every PPP session, so we stop here instead.
 echo "Checking PPP kernel support..."
-PPP_OK=0
-if modprobe ppp_generic 2>/dev/null && modprobe ppp_async 2>/dev/null && modprobe l2tp_ppp 2>/dev/null; then
-  PPP_OK=1
-else
-  echo "PPP modules did not load directly — trying linux-modules-extra for this kernel..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-modules-extra-$(uname -r)" 2>/dev/null || true
-  if modprobe ppp_generic 2>/dev/null && modprobe ppp_async 2>/dev/null && modprobe l2tp_ppp 2>/dev/null; then
-    PPP_OK=1
-  fi
-fi
-if [ "$PPP_OK" != "1" ]; then
+ppp_ready() {
+  modprobe ppp_generic 2>/dev/null && modprobe ppp_async 2>/dev/null \
+    && modprobe l2tp_ppp 2>/dev/null || return 1
+  # /dev/ppp appears via udev/devtmpfs once ppp_generic is loaded.
+  # Wait briefly, then prove it can really be opened.
+  for _ in 1 2 3 4 5; do
+    [ -c /dev/ppp ] && break
+    sleep 1
+  done
+  [ -c /dev/ppp ] || return 1
+  { exec 9<>/dev/ppp; } 2>/dev/null || return 1
+  exec 9>&-
+}
+if ! ppp_ready; then
   if grep -q '^# CONFIG_PPP is not set' "/boot/config-$(uname -r)" 2>/dev/null; then
     cat >&2 <<'PPPMSG'
 PPP is DISABLED in the running kernel (CONFIG_PPP is not set).
@@ -111,8 +121,10 @@ no longer ends in -cloud-amd64 and that
 succeeds. Only then re-run this installer.
 PPPMSG
   else
-    echo "ERROR: PPP modules (ppp_generic, ppp_async, l2tp_ppp) could not be loaded on kernel $(uname -r)." >&2
-    echo "Check 'ls /lib/modules/' and your kernel config, then re-run this installer." >&2
+    echo "ERROR: PPP is not usable on kernel $(uname -r):" >&2
+    echo "the modules ppp_generic, ppp_async, l2tp_ppp did not all load," >&2
+    echo "or /dev/ppp cannot be opened. Check 'ls /lib/modules/'," >&2
+    echo "'modprobe ppp_generic' and the kernel config, then re-run." >&2
   fi
   exit 1
 fi
@@ -126,8 +138,12 @@ echo "PPP kernel support: OK (kernel $(uname -r))"
 EXISTING_TUNPW="$(awk '{print $3; exit}' /etc/xl2tpd/l2tp-secrets 2>/dev/null || true)"
 EXISTING_MASTER_PSK="$(awk -F'"' '/^: PSK/ {print $2; exit}' /etc/ipsec.secrets 2>/dev/null || true)"
 
+# Secrets go into config files inside double quotes, so keep them to a
+# safe alphabet (generated ones are hex).
+valid_secret() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]{8,64}$'; }
+
 if [ -n "${TUNPW:-}" ]; then
-  : # explicit env override wins
+  valid_secret "$TUNPW" || die "TUNPW must be 8-64 characters of A-Z a-z 0-9 . _ - only."
 elif [ -n "$EXISTING_TUNPW" ]; then
   TUNPW="$EXISTING_TUNPW"
   echo "Reusing existing tunnel password (not changing it, so existing modems keep working)."
@@ -136,7 +152,7 @@ else
 fi
 
 if [ -n "${IPSEC_PSK:-}" ]; then
-  : # explicit env override wins
+  valid_secret "$IPSEC_PSK" || die "IPSEC_PSK must be 8-64 characters of A-Z a-z 0-9 . _ - only."
 elif [ -n "$EXISTING_MASTER_PSK" ]; then
   IPSEC_PSK="$EXISTING_MASTER_PSK"
   echo "Reusing existing master IPsec PSK (not changing it, so existing clients keep working)."
@@ -144,19 +160,30 @@ else
   IPSEC_PSK="$(openssl rand -hex 16)"
 fi
 
-# --- Server IP ---
-SERVER_IP="$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || true)"
-if [ -z "$SERVER_IP" ]; then
-  SERVER_IP="$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-fi
-if [ -z "$SERVER_IP" ]; then
-  die "Could not detect the server's public IPv4 address. Check outbound internet, then re-run."
-fi
+# --- Server IP (public IPv4, checked before anything destructive) ---
+SERVER_IP=""
+for url in https://api.ipify.org https://ifconfig.me; do
+  cand="$(curl -4 -fsS --max-time 10 "$url" 2>/dev/null || true)"
+  if printf '%s' "$cand" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    SERVER_IP="$cand"
+    break
+  fi
+done
+[ -n "$SERVER_IP" ] || die "Could not detect the server's public IPv4 address. Check outbound internet, then re-run."
 echo "Server IP: $SERVER_IP"
+
+# UDP 1701 must be free or already ours (xl2tpd from a previous install).
+# Checked here, BEFORE any service is stopped, so a refusal changes nothing.
+PORT_OWNER="$(ss -ulnpH 2>/dev/null | awk '$4 ~ /:1701$/' || true)"
+if [ -n "$PORT_OWNER" ] && ! printf '%s' "$PORT_OWNER" | grep -q 'xl2tpd'; then
+  die "UDP 1701 is already in use by another process:
+$PORT_OWNER"
+fi
 
 # --- Backups, before overwriting anything ---
 BACKUP_DIR="/root/easyl2tp-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 backup_file() {
   if [ -f "$1" ]; then
     cp -a "$1" "$BACKUP_DIR/" 2>/dev/null || true
@@ -173,26 +200,23 @@ backup_file /etc/ppp/pap-secrets
 backup_file /etc/strongswan.conf
 backup_file /etc/sysctl.d/99-l2tp.conf
 
-# --- From here on, this is the tested Gemini script, unchanged
+# --- From here on, this is the tested original script, unchanged
 # in behaviour except for the secret handling above and the
-# early PPP check. Two carried-over settings are flagged for
-# a security review before any public release (see SPEC.md):
-# the aggressive-mode PSK flag in strongswan.conf, and
-# "require authentication = no" in xl2tpd.conf (PPP auth is
-# still required via options.xl2tpd). They are kept here so
-# the tested behaviour does not change silently.
+# early PPP check. The two settings SPEC.md flagged were reviewed:
+#  - strongswan.conf: the "aggressive mode PSK" flag was removed.
+#    Aggressive mode only applies to a conn with aggressive=yes,
+#    and no conn here sets it, so it only added attack surface.
+#  - xl2tpd.conf: "require authentication" is now yes. In xl2tpd
+#    this is PPP-level (it adds "auth" to pppd), NOT the L2TP
+#    tunnel password (that is "challenge", left off on purpose so
+#    phones without a tunnel secret keep working).
 systemctl stop xl2tpd strongswan strongswan-starter strongswan-swanctl l2tp-firewall 2>/dev/null || true
-
-if ss -ulnH 2>/dev/null | grep -q ':1701 '; then
-  echo "UDP 1701 already in use by another process"
-  exit 1
-fi
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   xl2tpd ppp iptables conntrack curl openssl tcpdump gawk \
   strongswan strongswan-starter strongswan-charon strongswan-pki \
   libstrongswan libstrongswan-standard-plugins libstrongswan-extra-plugins \
-  libcharon-extra-plugins libcharon-extauth-plugins
+  libcharon-extra-plugins libcharon-extauth-plugins || die "apt-get install failed; nothing else was changed after this point. Fix the apt error and re-run."
 
 modprobe -a ppp_generic ppp_async l2tp_ppp 2>/dev/null || true
 
@@ -208,7 +232,6 @@ cat > /etc/strongswan.conf <<'SWAN'
 charon {
   load_modular = no
   install_routes = no
-  i_dont_care_about_security_and_use_aggressive_mode_psk = yes
   plugins {
     include strongswan.d/charon/*.conf
     updown {
@@ -286,7 +309,7 @@ ipsec saref = no
 [lns default]
 ip range = 10.99.0.10-10.99.0.250
 local ip = 10.99.0.1
-require authentication = no
+require authentication = yes
 challenge = no
 length bit = yes
 name = l2tpd
@@ -508,12 +531,13 @@ up)
   ip xfrm policy add dir fwd src $S1 dst 0.0.0.0/0 priority 1 action allow 2>/dev/null || true
   ip xfrm policy add dir out src 0.0.0.0/0 dst $S1 priority 1 action allow 2>/dev/null || true
 
-  iptables -P FORWARD ACCEPT 2>/dev/null || true
+  # Older installs opened the whole server to VPN clients; drop that rule.
+  del filter INPUT -i ppp+ -j ACCEPT
 
   add filter INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
   add filter INPUT -p udp -m multiport --dports 500,4500,1701 -j ACCEPT
   add filter INPUT -p esp -j ACCEPT
-  add filter INPUT -i ppp+ -j ACCEPT
+  add filter INPUT -i ppp+ -p icmp -j ACCEPT
   add filter FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
   add filter FORWARD -i ppp+ -j ACCEPT
   add filter FORWARD -o ppp+ -j ACCEPT
@@ -562,6 +586,7 @@ down)
 
   del filter INPUT -p udp -m multiport --dports 500,4500,1701 -j ACCEPT
   del filter INPUT -p esp -j ACCEPT
+  del filter INPUT -i ppp+ -p icmp -j ACCEPT
   del filter INPUT -i ppp+ -j ACCEPT
   del filter FORWARD -i ppp+ -j ACCEPT
   del filter FORWARD -o ppp+ -j ACCEPT
@@ -611,7 +636,25 @@ if [ -n "$ACT" ] && [ "$ACT" != "add" ] && [ "$ACT" != "del" ] && [ "$ACT" != "l
   ACT="add"
 fi
 
-SERVER_IP=$(curl -4 -s ifconfig.me)
+# Names and passwords end up in chap-secrets, ipsec.secrets and sed
+# patterns, so only a safe alphabet is accepted. Checked before anything
+# else runs, so a bad name changes nothing.
+if [ "$ACT" = "add" ] || [ "$ACT" = "del" ] || { [ "$ACT" = "reset" ] && [ -n "$USR" ]; }; then
+  if ! printf '%s' "$USR" | grep -Eq '^[A-Za-z0-9._-]{1,32}$'; then
+    echo "Invalid username: use 1-32 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)." >&2
+    exit 1
+  fi
+fi
+if [ "$ACT" = "add" ] && [ -n "$PAS" ]; then
+  if ! printf '%s' "$PAS" | grep -Eq '^[A-Za-z0-9._-]{6,64}$'; then
+    echo "Invalid password: use 6-64 characters of A-Z a-z 0-9 . _ - (no spaces or quotes)." >&2
+    exit 1
+  fi
+fi
+
+# The server IP is what the installer wrote into ipsec.conf (no network call).
+SERVER_IP=$(awk -F= '/^[[:space:]]*leftid=/ && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $2; exit}' /etc/ipsec.conf 2>/dev/null || true)
+[ -n "$SERVER_IP" ] || SERVER_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo unknown)
 MASTER_PSK=$(awk -F'"' '/^: PSK/ {print $2; exit}' /etc/ipsec.secrets)
 TUN_PASS=$(awk '{print $3; exit}' /etc/xl2tpd/l2tp-secrets)
 DB="/var/log/vpn-usage/totals.db"
@@ -763,7 +806,7 @@ elif [ "$ACT" = "stats" ]; then
   show_stats
 else
   echo "================================================================================"
-  echo "Server IP: $SERVER_IP | Master PSK: $MASTER_PSK | L2TP Secret: $TUN_PASS"
+  echo "Server IP: $SERVER_IP   (secrets are shown only on a user card: ezl2tp card <user>)"
   show_stats
   echo "Commands: l2tp-user add <user> <pass> | l2tp-user stats | l2tp-user reset [user] | l2tp-user logs"
 fi
@@ -775,8 +818,9 @@ chmod +x /usr/local/bin/l2tp-user
 # Remove the old name so a server does not end up with two commands.
 rm -f /usr/local/bin/vpn-panel 2>/dev/null || true
 PANEL_INSTALLED=0
-if [ -f "./ezl2tp" ]; then
-  cp ./ezl2tp /usr/local/bin/ezl2tp 2>/dev/null || true
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+if [ -f "$SELF_DIR/ezl2tp" ]; then
+  cp "$SELF_DIR/ezl2tp" /usr/local/bin/ezl2tp 2>/dev/null || true
   chmod +x /usr/local/bin/ezl2tp 2>/dev/null || true
   PANEL_INSTALLED=1
 else
@@ -796,24 +840,32 @@ systemctl disable --now strongswan strongswan-swanctl 2>/dev/null || true
 systemctl enable --now strongswan-starter xl2tpd l2tp-firewall
 systemctl restart strongswan-starter xl2tpd l2tp-firewall
 
+# Fail loudly if a service did not come up, instead of printing "Ready".
+FAILED=""
+for s in strongswan-starter xl2tpd l2tp-firewall; do
+  systemctl is-active --quiet "$s" || FAILED="$FAILED $s"
+done
+if [ -n "$FAILED" ]; then
+  echo "ERROR: these services are not running:$FAILED" >&2
+  echo "Look at: journalctl -u <service> --no-pager | tail -n 30" >&2
+  exit 1
+fi
+
 echo "=================================================="
-echo "easyl2tp VPN Server Ready on $SERVER_IP!"
+echo "easyl2tp VPN Server Ready on $SERVER_IP"
 echo "=================================================="
-echo "Kernel:                 $(uname -r)"
-echo "Services:"
-systemctl is-active strongswan-starter xl2tpd l2tp-firewall
+echo "Kernel:    $(uname -r)"
+echo "Services:  strongswan-starter, xl2tpd, l2tp-firewall (all active)"
+echo "Backups:   $BACKUP_DIR"
 echo "--------------------------------------------------"
-echo "Master IPsec PSK:       $IPSEC_PSK"
-echo "Modem tunnel password:  $TUNPW"
-echo "Backups (if any):       $BACKUP_DIR"
+echo "Secrets were generated or reused and are stored only on this"
+echo "server, root-only, in /etc/ipsec.secrets (master IPsec PSK),"
+echo "/etc/xl2tpd/l2tp-secrets (modem tunnel password) and"
+echo "/etc/ppp/chap-secrets (users). They are NOT printed here."
 echo "--------------------------------------------------"
-echo "SAVE THE TWO SECRETS ABOVE — they are also in"
-echo "/etc/ipsec.secrets (root-only) and"
-echo "/etc/xl2tpd/l2tp-secrets (root-only)."
-echo "Do not share them publicly. Share a user card"
-echo "only with that user."
-echo "--------------------------------------------------"
-echo "Add a user:   l2tp-user add <username>"
-echo "Panel:        ezl2tp"
-echo "Usage:        l2tp-user"
+echo "Next steps:"
+echo "  1. Add a user:        ezl2tp add <username>"
+echo "  2. Show their card:   ezl2tp card <username>"
+echo "     (a card holds that user's secrets - share it only with them)"
+echo "  3. Open the panel:    ezl2tp"
 echo "=================================================="
