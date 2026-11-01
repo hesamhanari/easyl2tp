@@ -19,13 +19,13 @@ printf '2026-01-01 10:00:00 | CONNECT | L2TP(ppp0) | test-ali | Session started\
 printf '#!/bin/bash\necho "STUB l2tp-user $@"\n' > "$TMP/l2tp-user-stub"
 chmod +x "$TMP/l2tp-user-stub"
 
-export VPN_PANEL_CHAP="$TMP/chap-secrets"
-export VPN_PANEL_IPSEC_SECRETS="$TMP/ipsec.secrets"
-export VPN_PANEL_L2TP_SECRETS="$TMP/l2tp-secrets"
-export VPN_PANEL_TOTALS_DB="$TMP/totals.db"
-export VPN_PANEL_SESSIONS_LOG="$TMP/sessions.log"
-export VPN_PANEL_SESSIONS_DIR="$TMP/sessions"
-export VPN_PANEL_L2TP_USER="$TMP/l2tp-user-stub"
+export EZL2TP_CHAP="$TMP/chap-secrets"
+export EZL2TP_IPSEC_SECRETS="$TMP/ipsec.secrets"
+export EZL2TP_L2TP_SECRETS="$TMP/l2tp-secrets"
+export EZL2TP_TOTALS_DB="$TMP/totals.db"
+export EZL2TP_SESSIONS_LOG="$TMP/sessions.log"
+export EZL2TP_SESSIONS_DIR="$TMP/sessions"
+export EZL2TP_L2TP_USER="$TMP/l2tp-user-stub"
 
 fail=0
 check() { # check <name> <haystack> <needle>
@@ -39,19 +39,58 @@ check() { # check <name> <haystack> <needle>
 bash -n "$PANEL" || { echo "FAIL: syntax check"; exit 1; }
 echo "ok: syntax check"
 
-USERS="$(bash "$PANEL" users)"
+# Run the panel the way install.sh installs it: a file named "ezl2tp"
+# on PATH. This is what proves the vpn-panel -> ezl2tp rename works.
+mkdir -p "$TMP/bin"
+cp "$PANEL" "$TMP/bin/ezl2tp"
+chmod +x "$TMP/bin/ezl2tp"
+PATH="$TMP/bin:$PATH"
+export PATH
+if command -v vpn-panel >/dev/null 2>&1; then
+  echo "FAIL: old command vpn-panel is still on PATH"; fail=1
+else
+  echo "ok: old command vpn-panel is gone"
+fi
+if grep -qiE 'vpn-panel|mehr23' "$PANEL"; then
+  echo "FAIL: panel still mentions vpn-panel or mehr23"; fail=1
+else
+  echo "ok: panel has no vpn-panel / mehr23 mentions"
+fi
+
+STATUS="$(ezl2tp status)"
+check "status: header" "$STATUS" "ezl2tp"
+check "status: users line" "$STATUS" "Users:           2 total, 1 online"
+check "status: traffic" "$STATUS" "Total traffic:"
+
+USERS="$(ezl2tp users)"
 check "users: ali online" "$USERS" "test-ali"
 check "users: ali ONLINE" "$USERS" "ONLINE"
 check "users: sara offline" "$USERS" "offline"
 
-LIVE="$(bash "$PANEL" live)"
+LIVE="$(ezl2tp live)"
 check "live: ppp0 session" "$LIVE" "ppp0"
 
-CARD="$(bash "$PANEL" card test-ali)"
+CARD="$(ezl2tp card test-ali)"
 check "card: modem section" "$CARD" "plain L2TP"
 check "card: IKEv2 section" "$CARD" "IKEv2"
 
-if bash "$PANEL" card no-such-user >/dev/null 2>&1; then
+check "card: own password" "$CARD" "test-pass-ali"
+check "card: master PSK" "$CARD" "test-master-psk"
+check "card: tunnel password" "$CARD" "test-tun-pass"
+if printf '%s' "$CARD" | grep -qF "test-pass-sara"; then
+  echo "FAIL: card leaks another user's password"; fail=1
+else
+  echo "ok: card does not contain other users' passwords"
+fi
+if printf '%s' "$USERS" | grep -qE 'test-pass|test-master|test-tun'; then
+  echo "FAIL: users list shows a secret"; fail=1
+else
+  echo "ok: users list shows no secrets"
+fi
+check "users: ali totals" "$USERS" "5.72 MB"
+check "stats delegates to l2tp-user" "$(ezl2tp stats)" "STUB l2tp-user stats"
+
+if ezl2tp card no-such-user >/dev/null 2>&1; then
   echo "FAIL: missing user should exit non-zero"; fail=1
 else
   echo "ok: missing user exits non-zero"

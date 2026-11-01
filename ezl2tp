@@ -1,12 +1,12 @@
 #!/bin/bash
-# ezl2tp — TUI/CLI panel for the mehr23 L2TP + IKEv2 server
-# Built on top of the existing Gemini script, it does NOT replace it.
+# ezl2tp — TUI/CLI panel for an easyl2tp L2TP + IKEv2 server
+# Built on top of the easyl2tp installer, it does NOT replace it.
 # It only reads/writes through the existing data files and, for
 # add/del/stats/reset/logs, delegates to /usr/local/bin/l2tp-user
-# so ipsec.secrets rebuilding stays exactly as the Gemini script does it.
+# so ipsec.secrets rebuilding stays in one place.
 #
-# Install on mehr23 as root:
-#   cp ezl2tp.sh /usr/local/bin/ezl2tp
+# Installed by install.sh. To install by hand, as root:
+#   cp ezl2tp /usr/local/bin/ezl2tp
 #   chmod +x /usr/local/bin/ezl2tp
 #   ezl2tp
 #
@@ -17,21 +17,23 @@
 #                     ezl2tp card <user>
 #                     ezl2tp restart
 #
-# Data sources (overridable with VPN_PANEL_* env vars, for testing only):
+# Data sources (overridable with EZL2TP_* env vars, for testing only):
 #   chap-secrets, ipsec.secrets, l2tp-secrets,
 #   /var/log/vpn-usage/totals.db, /var/log/vpn-usage/sessions.log,
 #   /run/vpn-sessions/*, /sys/class/net/ppp*
 
 set -u
 
-CHAP="${VPN_PANEL_CHAP:-/etc/ppp/chap-secrets}"
-IPSEC_SECRETS="${VPN_PANEL_IPSEC_SECRETS:-/etc/ipsec.secrets}"
-L2TP_SECRETS="${VPN_PANEL_L2TP_SECRETS:-/etc/xl2tpd/l2tp-secrets}"
-TOTALS_DB="${VPN_PANEL_TOTALS_DB:-/var/log/vpn-usage/totals.db}"
-SESSIONS_LOG="${VPN_PANEL_SESSIONS_LOG:-/var/log/vpn-usage/sessions.log}"
-SESSIONS_DIR="${VPN_PANEL_SESSIONS_DIR:-/run/vpn-sessions}"
-L2TP_USER="${VPN_PANEL_L2TP_USER:-/usr/local/bin/l2tp-user}"
+CHAP="${EZL2TP_CHAP:-/etc/ppp/chap-secrets}"
+IPSEC_SECRETS="${EZL2TP_IPSEC_SECRETS:-/etc/ipsec.secrets}"
+L2TP_SECRETS="${EZL2TP_L2TP_SECRETS:-/etc/xl2tpd/l2tp-secrets}"
+TOTALS_DB="${EZL2TP_TOTALS_DB:-/var/log/vpn-usage/totals.db}"
+SESSIONS_LOG="${EZL2TP_SESSIONS_LOG:-/var/log/vpn-usage/sessions.log}"
+SESSIONS_DIR="${EZL2TP_SESSIONS_DIR:-/run/vpn-sessions}"
+L2TP_USER="${EZL2TP_L2TP_USER:-/usr/local/bin/l2tp-user}"
 
+# C_BOLD/C_YELLOW/C_CYAN are reserved for PR 2 (menu polish).
+# shellcheck disable=SC2034
 if [ -t 1 ]; then
   C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_RED='\033[31m'
   C_YELLOW='\033[33m'; C_CYAN='\033[36m'; C_RESET='\033[0m'
@@ -162,7 +164,7 @@ show_status() {
 $(total_traffic)
 EOF
   echo "=================================================="
-  echo "  VPN Panel — Status"
+  echo "  ezl2tp — Status"
   echo "=================================================="
   printf "Server:          %s\n" "$(server_ip)"
   printf "Kernel:          %s\n" "$kernel"
@@ -187,7 +189,7 @@ EOF
 }
 
 show_users() {
-  local u sess rx tx status
+  local u rx tx status
   echo "=================================================="
   printf "%-16s %-9s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL"
   echo "--------------------------------------------------"
@@ -247,7 +249,7 @@ show_logs() {
 require_l2tp_user() {
   if [ ! -x "$L2TP_USER" ]; then
     echo "ERROR: $L2TP_USER not found or not executable."
-    echo "Run the Gemini VPN script first, then retry."
+    echo "Run the easyl2tp install.sh first, then retry."
     return 1
   fi
   return 0
@@ -388,7 +390,7 @@ fi
 while true; do
   clear 2>/dev/null || true
   echo "=================================================="
-  echo "  VPN Panel — mehr23  (L2TP + IKEv2)"
+  echo "  ezl2tp — L2TP + IKEv2 panel"
   echo "=================================================="
   printf "Server: %s   Kernel: %s   Users: %s, %s online\n" \
     "$(server_ip)" "$(uname -r 2>/dev/null || echo unknown)" "$(count_users)" "$(count_online)"
