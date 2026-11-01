@@ -129,12 +129,20 @@ Everything that is about one user lives under **2 User Management**:
 0 Back
 ```
 
-**Show all users** is one numbered table with every user's status, upload,
-download, total and data limit. Rows of users who are connected are
-**green**, rows of users who are offline are **red** (a user who is over
-their limit shows `BLOCKED` in the status column). The numbers are the same
-ones `ezl2tp users` and `l2tp-user stats` print: the saved totals plus the
-live counters of open sessions. Type a user's number to open that user:
+**Show all users** is one numbered table, **one row per user**, with the
+user's status, upload, download, total, data limit and `EXPIRE` (the end of
+the limit period, `YYYY-MM-DD HH:MM UTC`). `EXPIRE` is `-` for an unlimited
+user and for a limited user whose period has not started yet (it starts at
+their first connection). The whole row has one colour: **green** = ONLINE,
+**yellow** = BLOCKED (over the limit until the period ends, even if still
+connected), **red** = offline. The numbers are the same ones `ezl2tp users`
+and `l2tp-user stats` print: the saved totals plus the live counters of open
+sessions. The prompt is `Select a user number (0 = back, r = refresh):` -
+type a user's number to open that user, `0` to go back, or `r` (or `R`) to
+read the usage again and redraw the table (the numbers are assigned again,
+so use the number you see after the refresh). `ezl2tp users` prints the same
+table once, without the numbers and without a prompt. A user's used / left /
+period details are on their card and in their menu.
 
 ```
 1 Show card
@@ -292,7 +300,7 @@ then `ezl2tp limit` says so instead of doing anything.
 - `tests/smoke-test.sh` — fake-data smoke test for the panel; also runs
   the four suites below.
 - `tests/panel-test.sh` — the panel menus with fake users: the exact main
-  menu, the numbered green/red table, every per-user action, Add user
+  menu, the numbered green/yellow/red table, every per-user action, Add user
   (1 GB default), backup create / list / restore, the update check and the
   uninstall guard. Runs the real `l2tp-user` from `install.sh` against a
   fake server tree.
