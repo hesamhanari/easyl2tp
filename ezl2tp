@@ -337,18 +337,21 @@ EOF
   return 0
 }
 
-# One table: usage, limit and status of every user. Rows come from the same
-# "l2tp-user usage" rows as "l2tp-user stats" and the status screen (totals.db
-# plus the live counters of open sessions), so they cannot disagree.
-# "numbered" adds a # column for the menu; rows are green when the user has a
-# live session and red when offline.
+# One table, one row per user: usage, limit, limit-period end and status. Rows
+# come from the same "l2tp-user usage" rows as "l2tp-user stats" and the status
+# screen (totals.db plus the live counters of open sessions), so they cannot
+# disagree. "numbered" adds a # column for the menu. The whole row has one
+# colour: green = ONLINE, yellow = BLOCKED (over the limit, even if still
+# connected), red = offline. EXPIRE is the end of the limit period
+# (YYYY-MM-DD HH:MM UTC); "-" for an unlimited user or a period not started.
+# Width: 93 columns, 98 with the # column, so it fits a 100-column terminal.
 show_users() {
-  local numbered="${1:-}" u rx tx sess status lrow lstate lim lcol color prefix hdr rule n=0
+  local numbered="${1:-}" u rx tx sess status lrow lstate lim lend lcol expire color prefix hdr rule n=0
   load_usage
   load_users_list
-  if [ -n "$numbered" ]; then hdr="  #  "; rule=83; else hdr=""; rule=78; fi
+  if [ -n "$numbered" ]; then hdr="  #  "; rule=98; else hdr=""; rule=93; fi
   printf '%*s\n' "$rule" "" | tr ' ' '='
-  printf "%s%-16s %-9s %-12s %-12s %-12s %-12s\n" "$hdr" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL" "LIMIT"
+  printf "%s%-16s %-8s %-11s %-11s %-11s %-10s %-20s\n" "$hdr" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL" "LIMIT" "EXPIRE"
   printf '%*s\n' "$rule" "" | tr ' ' '-'
   if [ "${#USERS_LIST[@]}" -eq 0 ]; then echo "No users yet."; fi
   for u in "${USERS_LIST[@]+"${USERS_LIST[@]}"}"; do
@@ -359,18 +362,19 @@ EOF
     if [ "$sess" != "-" ]; then status="ONLINE"; color="$C_GREEN"; else status="offline"; color="$C_RED"; fi
     lrow="$(user_limit_row "$u")"
     lcol="unlimited"
+    expire="-"
     if [ -n "$lrow" ]; then
-      lim="$(printf '%s' "$lrow" | awk '{ print $2 }')"
-      lstate="$(printf '%s' "$lrow" | awk '{ print $6 }')"
+      read -r _ lim _ _ lend lstate _ <<EOF
+$lrow
+EOF
       lcol="$(human "$lim")"
-      if [ "$lstate" = "BLOCKED" ]; then status="BLOCKED"; fi
+      # A pending period has no start and no end yet: nothing to show.
+      if [ "$lstate" != "pending" ] && [ "${lend:-0}" -gt 0 ]; then expire="$(fmt_epoch "$lend" time)"; fi
+      if [ "$lstate" = "BLOCKED" ]; then status="BLOCKED"; color="$C_YELLOW"; fi
     fi
     prefix=""
     if [ -n "$numbered" ]; then prefix="$(printf '%3s  ' "$n")"; fi
-    printf "%b%s%-16s %-9s %-12s %-12s %-12s %-12s%b\n" "$color" "$prefix" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))" "$lcol" "$C_RESET"
-    if [ -n "$lrow" ]; then
-      printf '%b%s%b\n' "$color" "$(describe_limit "    -> " "$u")" "$C_RESET"
-    fi
+    printf "%b%s%-16s %-8s %-11s %-11s %-11s %-10s %-20s%b\n" "$color" "$prefix" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))" "$lcol" "$expire" "$C_RESET"
   done
   printf '%*s\n' "$rule" "" | tr ' ' '='
   echo "(Passwords are NOT shown here. Use 'card <user>' for one user's card.)"
@@ -662,16 +666,20 @@ EOF
   done
 }
 
-# User Management > Show all users: the numbered table, then pick a number.
+# User Management > Show all users: the numbered table, then pick a number
+# (r = refresh, 0 = back).
 show_all_users_menu() {
   local pick
   while true; do
     [ -t 1 ] && clear 2>/dev/null
     show_users numbered
     if [ "${#USERS_LIST[@]}" -eq 0 ]; then pause; return 0; fi
-    ask "Select a user number (0 = back): "; pick="$REPLY_VAL"
+    ask "Select a user number (0 = back, r = refresh): "; pick="$REPLY_VAL"
     case "$pick" in
       0|'') return 0 ;;
+      # Refresh: the loop re-runs show_users (fresh totals + live counters,
+      # numbers assigned again) and prompts again without leaving the screen.
+      r|R) continue ;;
       *[!0-9]*) echo "Invalid choice."; sleep 1; continue ;;
     esac
     if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#USERS_LIST[@]}" ]; then echo "Out of range."; sleep 1; continue; fi

@@ -202,12 +202,22 @@ Run `ezl2tp` as root.
    one-shot commands still work: `ezl2tp status`, `ezl2tp users`,
    `ezl2tp card test-user1`, `ezl2tp stats`, `ezl2tp live`, `ezl2tp logs`.
 2. **2 User Management** shows `1 Show all users`, `2 Add user`, `0 Back`.
-3. **Show all users**: one numbered table with status, upload, download,
-   total and limit. The connected user's row is **green**, offline rows are
-   **red**. Compare the numbers with `l2tp-user stats` in another terminal: the
-   upload / download / total of every user must be identical. Type a number:
-   the user's menu opens (Show card, Change password, Set / clear data limit,
-   Reset data, Disconnect now, Delete user, Back).
+3. **Show all users**: one numbered table, exactly one row per user, with
+   status, upload, download, total, limit and `EXPIRE` (right after `LIMIT`).
+   No second detail line under a limited user. The whole row has one colour:
+   the connected user is **green**, a user over the limit is **yellow**
+   (`BLOCKED`), offline users are **red**. `EXPIRE` is the period end
+   (`YYYY-MM-DD HH:MM UTC`) for a limited user whose period has started, and
+   `-` for an unlimited user or a period that has not started yet. The table
+   must not wrap in a 100-column terminal. Compare the numbers with
+   `l2tp-user stats` in another terminal: the upload / download / total of
+   every user must be identical. The prompt is
+   `Select a user number (0 = back, r = refresh):`. Connect or disconnect a
+   phone, then type `r` (and `R`): the table is redrawn with fresh numbers and
+   the prompt comes back, you stay on the screen. Type a number: the user's
+   menu opens (Show card, Change password, Set / clear data limit, Reset data,
+   Disconnect now, Delete user, Back); `0` goes back. `ezl2tp users` prints
+   the same table once, with no numbers and no prompt.
 4. **Per-user actions** on `test-user2` (offline):
    - *Show card* shows only that user's password.
    - *Change password* with Enter gives a random password; the old one no

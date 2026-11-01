@@ -142,6 +142,7 @@ unset EASYL2TP_BRANCH
 GB=1073741824
 GREEN=$'\033[32m'
 RED=$'\033[31m'
+YELLOW=$'\033[33m'
 SHA_OLD="1111111111111111111111111111111111111111"
 SHA_NEW="2222222222222222222222222222222222222222"
 
@@ -271,13 +272,128 @@ ONE="$(bash "$PANEL" users 2>&1)"
 has "one-shot users: still works" "$ONE" "test-aa"
 hasnt "one-shot users: no # column" "$ONE" "  #  USERNAME"
 
-# Colors: green for the online row, red for offline rows.
+# Colors: green = online, yellow = BLOCKED, red = offline (whole row).
 COLOR_OUT="$(printf '%s\n' 2 1 0 0 0 | EZL2TP_COLOR=always timeout 60 bash "$PANEL" 2>&1)"
 has "color: online row is green" "$COLOR_OUT" "${GREEN}  1  test-aa"
 has "color: offline row is red" "$COLOR_OUT" "${RED}  2  test-bb"
-has "color: blocked offline row is red" "$COLOR_OUT" "${RED}  3  test-cc"
+has "color: blocked row is yellow" "$COLOR_OUT" "${YELLOW}  3  test-cc"
+hasnt "color: blocked row is not red" "$COLOR_OUT" "${RED}  3  test-cc"
 hasnt "color: online row is not red" "$COLOR_OUT" "${RED}  1  test-aa"
 hasnt "color: offline row is not green" "$COLOR_OUT" "${GREEN}  2  test-bb"
+
+# ================================================================
+# 3b. EXPIRE column, one row per user, three row colours, refresh
+# ================================================================
+# Six fake users: online + unlimited, offline + unlimited, online + limited
+# (started), offline + limited (period not started), offline + BLOCKED,
+# online + BLOCKED.
+fresh
+add_user test-dd; add_user test-ee; add_user test-ff
+set_totals test-dd 100 200; set_totals test-ee 10 20; set_totals test-ff 5000 5000
+NOW="$(date +%s)"
+put_limit test-dd $((10 * GB)) "$NOW"              # online, limited, period running
+put_limit test-ee $((5 * GB)) 0                    # period not started
+put_limit test-ff 1000 "$NOW"                      # over the limit while connected
+ppp_dev ppp1 100 200; ppp_dev ppp2 100 200
+printf 'test-dd 10.99.0.11\n' > "$R/run/vpn-sessions/ppp1"
+printf 'test-ff 10.99.0.12\n' > "$R/run/vpn-sessions/ppp2"
+END_FMT="$(date -u -d "@$((NOW + 30 * 86400))" '+%Y-%m-%d %H:%M UTC')"
+
+ONE="$(bash "$PANEL" users 2>&1)"
+NUM="$(panel 2 1 0 0 0)"
+for kind in one numbered; do
+  if [ "$kind" = one ]; then T="$ONE"; pre=""; else T="$NUM"; pre=" +[0-9]+  "; fi
+  row() { printf '%s\n' "$T" | grep -E "^${pre:-}$1 "; }
+  rowtxt() { row "$1" | sed 's/ *$//'; }
+  has "$kind: header has EXPIRE right after LIMIT" "$T" "LIMIT      EXPIRE"
+  eq "$kind: online unlimited, EXPIRE is a dash" "$(rowtxt test-aa | awk '{ print $NF }')" "-"
+  eq "$kind: offline unlimited, EXPIRE is a dash" "$(rowtxt test-bb | awk '{ print $NF }')" "-"
+  has "$kind: online limited, EXPIRE is the period end" "$(row test-dd)" "$END_FMT"
+  has "$kind: blocked, EXPIRE is the period end" "$(row test-cc)" "$END_FMT"
+  has "$kind: blocked and still online, EXPIRE is the period end" "$(row test-ff)" "$END_FMT"
+  eq "$kind: limited, period not started, EXPIRE is a dash" "$(rowtxt test-ee | awk '{ print $NF }')" "-"
+  hasnt "$kind: period not started shows no date" "$(row test-ee)" "UTC"
+  has "$kind: online row says ONLINE" "$(row test-dd)" "ONLINE"
+  has "$kind: offline row says offline" "$(row test-ee)" "offline"
+  has "$kind: blocked row says BLOCKED" "$(row test-ff)" "BLOCKED"
+  hasnt "$kind: no second detail line" "$T" "->"
+  hasnt "$kind: no 'left'/'used' detail text" "$T" "left "
+  # exactly one row per user: the lines between the dashes and the closing ===
+  rows="$(printf '%s\n' "$T" | awk 'length($0) >= 60 && /^-+$/ { f = 1; next } length($0) >= 60 && /^=+$/ { if (f) exit } f' | wc -l | tr -d ' ')"
+  eq "$kind: exactly one row per user (6 users, $rows rows)" "$rows" "6"
+  # no line may be wider than a 100-column terminal, and the rules are as wide as the rows
+  widest="$(printf '%s\n' "$T" | grep -v 'Select a user number' | sed 's/^Choice: //' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  if [ "$widest" -le 100 ]; then ok "$kind: fits in 100 columns ($widest)"; else bad "$kind: too wide ($widest columns)"; fi
+  rule="$(printf '%s\n' "$T" | grep -E '^={60,}$' | head -1 | awk '{ print length($0) }')"
+  hdrw="$(printf '%s\n' "$T" | grep -E 'USERNAME' | awk '{ print length($0) }')"
+  if [ "$hdrw" -le "$rule" ]; then ok "$kind: header ($hdrw) fits the rule ($rule)"; else bad "$kind: header ($hdrw) wider than the rule ($rule)"; fi
+  has "$kind: footer note about passwords unchanged" "$T" "(Passwords are NOT shown here. Use 'card <user>' for one user's card.)"
+  has "$kind: footer note about limits unchanged" "$T" "(LIMIT: 'ezl2tp limit <user> <GB>' sets one, 'ezl2tp limit <user> clear' removes it.)"
+done
+eq "one-shot users prints the table once" "$(printf '%s\n' "$ONE" | grep -c USERNAME)" "1"
+hasnt "one-shot users has no prompt" "$ONE" "Select a user number"
+has "numbered: prompt offers number, 0 = back, r = refresh" "$NUM" "Select a user number (0 = back, r = refresh): "
+
+# Three distinct row colours, the whole row (from the start of the row to the
+# reset after the EXPIRE value).
+CO="$(printf '%s\n' 2 1 0 0 0 | EZL2TP_COLOR=always timeout 60 bash "$PANEL" 2>&1)"
+RESET=$'\033[0m'
+colrow() { printf '%s\n' "$CO" | grep -E "^.\[[0-9]+m +$1  $2 "; }
+eq "color: online unlimited row is green" "$(colrow 1 test-aa | cut -c1-5)" "$GREEN"
+eq "color: offline row is red" "$(colrow 2 test-bb | cut -c1-5)" "$RED"
+eq "color: blocked offline row is yellow" "$(colrow 3 test-cc | cut -c1-5)" "$YELLOW"
+eq "color: online limited row is green" "$(colrow 4 test-dd | cut -c1-5)" "$GREEN"
+eq "color: pending-period offline row is red" "$(colrow 5 test-ee | cut -c1-5)" "$RED"
+eq "color: blocked but connected row is yellow" "$(colrow 6 test-ff | cut -c1-5)" "$YELLOW"
+for r in 1 2 3 4 5 6; do
+  line="$(printf '%s\n' "$CO" | grep -E "^.\[[0-9]+m +$r  test-")"
+  case "$line" in *"$RESET") ok "color: row $r is one colour to its end (EXPIRE included)" ;; *) bad "color: row $r does not end with a reset" ;; esac
+  eq "color: row $r has a single colour code" "$(printf '%s' "$line" | grep -o $'\033\\[[0-9]*m' | wc -l | tr -d ' ')" "2"
+done
+
+# Refresh loop: r and R re-read usage and re-number, without leaving the screen.
+# Between the keys the fake server changes: test-bb connects (new session,
+# new bytes), and a new user test-00 appears that sorts first.
+fresh
+refresh_run() { # refresh_run <key> ...: keys typed after 2 1, one second apart
+  (
+    printf '2\n1\n'
+    sleep 1
+    sed -i 's/^test-bb 500 600$/test-bb 500000 600000/' "$R/var/log/vpn-usage/totals.db"
+    printf 'test-bb 10.99.0.20\n' > "$R/run/vpn-sessions/ppp7"; ppp_dev ppp7 0 0
+    add_user test-00; set_totals test-00 1 1
+    for k in "$@"; do printf '%s\n' "$k"; sleep 1; done
+    printf '0\n0\n0\n0\n'
+  ) | timeout 60 bash "$PANEL" 2>&1
+}
+for key in r R; do
+  OUT="$(refresh_run "$key")"
+  eq "refresh ($key): the table is printed again" "$(printf '%s\n' "$OUT" | grep -c 'USERNAME')" "2"
+  eq "refresh ($key): the prompt is shown again" "$(printf '%s\n' "$OUT" | grep -c 'Select a user number')" "2"
+  hasnt "refresh ($key): not an invalid choice" "$OUT" "Invalid choice"
+  hasnt "refresh ($key): stays on the screen, opens no user" "$OUT" "User: "
+  has "refresh ($key): 0 afterwards goes back to User Management" "$OUT" "2 Add user"
+  FIRST="$(printf '%s\n' "$OUT" | awk '/USERNAME/ { n++ } n == 1')"
+  SECOND="$(printf '%s\n' "$OUT" | awk '/USERNAME/ { n++ } n == 2')"
+  has "refresh ($key): before, test-bb is offline" "$(printf '%s\n' "$FIRST" | grep -E '^ +2  test-bb ')" "offline"
+  hasnt "refresh ($key): before, there is no test-00" "$FIRST" "test-00"
+  has "refresh ($key): after, test-bb is ONLINE" "$(printf '%s\n' "$SECOND" | grep -E '^ +3  test-bb ')" "ONLINE"
+  has "refresh ($key): after, the new usage is read (488.28 KB upload)" "$(printf '%s\n' "$SECOND" | grep -E '^ +3  test-bb ')" "488.28 KB"
+  has "refresh ($key): after, the new user is row 1" "$(printf '%s\n' "$SECOND" | grep -E '^ +1  test-00 ')" "offline"
+  # a number after a refresh uses the NEW numbering: 1 is now test-00
+  fresh
+  OUT="$(refresh_run "$key" 1)"
+  has "refresh ($key): the list is re-numbered, so 1 opens test-00" "$OUT" "User: test-00"
+  hasnt "refresh ($key): 1 does not open test-aa" "$OUT" "User: test-aa"
+  fresh
+done
+# a refresh with nothing changed just repeats the table
+fresh
+OUT="$(panel 2 1 r r 0 0 0)"
+eq "refresh twice: the table is printed three times" "$(printf '%s\n' "$OUT" | grep -c 'USERNAME')" "3"
+hasnt "refresh twice: no invalid choice" "$OUT" "Invalid choice"
+OUT="$(panel 2 1 x 0 0 0)"
+has "other letters are still an invalid choice" "$OUT" "Invalid choice."
 
 # ================================================================
 # 4. Numbered select opens that user's menu
