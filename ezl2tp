@@ -1,0 +1,438 @@
+#!/bin/bash
+# ezl2tp — TUI/CLI panel for the mehr23 L2TP + IKEv2 server
+# Built on top of the existing Gemini script, it does NOT replace it.
+# It only reads/writes through the existing data files and, for
+# add/del/stats/reset/logs, delegates to /usr/local/bin/l2tp-user
+# so ipsec.secrets rebuilding stays exactly as the Gemini script does it.
+#
+# Install on mehr23 as root:
+#   cp ezl2tp.sh /usr/local/bin/ezl2tp
+#   chmod +x /usr/local/bin/ezl2tp
+#   ezl2tp
+#
+# Interactive menu:   ezl2tp
+# One-shot commands:  ezl2tp status | users | stats | live | logs
+#                     ezl2tp add <user> [password]
+#                     ezl2tp del <user>
+#                     ezl2tp card <user>
+#                     ezl2tp restart
+#
+# Data sources (overridable with VPN_PANEL_* env vars, for testing only):
+#   chap-secrets, ipsec.secrets, l2tp-secrets,
+#   /var/log/vpn-usage/totals.db, /var/log/vpn-usage/sessions.log,
+#   /run/vpn-sessions/*, /sys/class/net/ppp*
+
+set -u
+
+CHAP="${VPN_PANEL_CHAP:-/etc/ppp/chap-secrets}"
+IPSEC_SECRETS="${VPN_PANEL_IPSEC_SECRETS:-/etc/ipsec.secrets}"
+L2TP_SECRETS="${VPN_PANEL_L2TP_SECRETS:-/etc/xl2tpd/l2tp-secrets}"
+TOTALS_DB="${VPN_PANEL_TOTALS_DB:-/var/log/vpn-usage/totals.db}"
+SESSIONS_LOG="${VPN_PANEL_SESSIONS_LOG:-/var/log/vpn-usage/sessions.log}"
+SESSIONS_DIR="${VPN_PANEL_SESSIONS_DIR:-/run/vpn-sessions}"
+L2TP_USER="${VPN_PANEL_L2TP_USER:-/usr/local/bin/l2tp-user}"
+
+if [ -t 1 ]; then
+  C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_RED='\033[31m'
+  C_YELLOW='\033[33m'; C_CYAN='\033[36m'; C_RESET='\033[0m'
+else
+  C_BOLD=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''; C_RESET=''
+fi
+
+SERVER_IP_CACHE=""
+
+human() {
+  awk -v x="${1:-0}" 'BEGIN {
+    split("B KB MB GB TB", u, " "); s = 1
+    while (x >= 1024 && s < 5) { x /= 1024; s++ }
+    printf "%.2f %s", x, u[s]
+  }'
+}
+
+is_ipv4() {
+  case "$1" in
+    ''|*[!0-9.]* ) return 1 ;;
+  esac
+  printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+server_ip() {
+  if [ -n "$SERVER_IP_CACHE" ]; then printf '%s' "$SERVER_IP_CACHE"; return; fi
+  local ip="" cand=""
+  if command -v curl >/dev/null 2>&1; then
+    # -4 on purpose: the modem/phone need the IPv4 address, not IPv6.
+    # Validate the result: some ifconfig.me paths return an IPv6
+    # address even with -4 (proxy environments), so fall through
+    # to the next source if it is not IPv4.
+    cand="$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || true)"
+    if is_ipv4 "$cand"; then ip="$cand"; fi
+    if [ -z "$ip" ]; then
+      cand="$(curl -4 -s --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+      if is_ipv4 "$cand"; then ip="$cand"; fi
+    fi
+  fi
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  fi
+  SERVER_IP_CACHE="${ip:-unknown}"
+  printf '%s' "$SERVER_IP_CACHE"
+}
+
+master_psk() {
+  awk -F'"' '/^: PSK/ {print $2; exit}' "$IPSEC_SECRETS" 2>/dev/null || true
+}
+
+tun_pass() {
+  awk '{print $3; exit}' "$L2TP_SECRETS" 2>/dev/null || true
+}
+
+list_users() {
+  [ -f "$CHAP" ] || return 0
+  awk '!/^#/ && NF >= 3 { gsub(/"/, "", $1); if ($1 != "") print $1 }' "$CHAP" 2>/dev/null
+}
+
+user_pass() {
+  local want="$1"
+  [ -f "$CHAP" ] || return 0
+  awk -v u="$want" '{ gsub(/"/, ""); if ($1 == u) { print $3; exit } }' "$CHAP" 2>/dev/null
+}
+
+user_totals() {
+  local want="$1" rx=0 tx=0
+  if [ -f "$TOTALS_DB" ]; then
+    read -r rx tx <<EOF
+$(awk -v u="$want" '$1 == u {print $2, $3; exit}' "$TOTALS_DB" 2>/dev/null)
+EOF
+  fi
+  printf '%s %s' "${rx:-0}" "${tx:-0}"
+}
+
+# Prints one line per live session for a user: "ppp3 <peer IP>" etc.
+user_sessions() {
+  local want="$1" f u peer
+  [ -d "$SESSIONS_DIR" ] || return 0
+  for f in "$SESSIONS_DIR"/*; do
+    [ -f "$f" ] || continue
+    read -r u peer < "$f" 2>/dev/null || continue
+    u="$(printf '%s' "$u" | tr -d '"')"
+    if [ "$u" = "$want" ]; then
+      printf '%s %s\n' "$(basename "$f")" "${peer:-}"
+    fi
+  done
+}
+
+count_users() { list_users | wc -l | tr -d ' '; }
+
+count_online() {
+  local n=0
+  if [ -d "$SESSIONS_DIR" ]; then
+    # Count distinct users with a live session file, not files.
+    n="$(awk '{ gsub(/"/, "", $1); if ($1 != "") print $1 }' "$SESSIONS_DIR"/* 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+  fi
+  printf '%s' "${n:-0}"
+}
+
+total_traffic() {
+  if [ -f "$TOTALS_DB" ]; then
+    awk '{ r += $2; t += $3 } END { printf "%s %s", r + 0, t + 0 }' "$TOTALS_DB" 2>/dev/null
+  else
+    printf '0 0'
+  fi
+}
+
+svc() {
+  local s
+  # is-active exits non-zero when a service is inactive, so do NOT
+  # use "|| echo unknown" here — it would append a second line.
+  s="$(systemctl is-active "$1" 2>/dev/null || true)"
+  [ -z "$s" ] && s="unknown"
+  if [ "$s" = "active" ]; then
+    printf '%b%s%b' "$C_GREEN" "active" "$C_RESET"
+  else
+    printf '%b%s%b' "$C_RED" "$s" "$C_RESET"
+  fi
+}
+
+show_status() {
+  local kernel ppp users online rx tx
+  kernel="$(uname -r 2>/dev/null || echo unknown)"
+  if [ -e /dev/ppp ]; then ppp="${C_GREEN}yes${C_RESET}"; else ppp="${C_RED}no${C_RESET}"; fi
+  users="$(count_users)"; online="$(count_online)"
+  read -r rx tx <<EOF
+$(total_traffic)
+EOF
+  echo "=================================================="
+  echo "  VPN Panel — Status"
+  echo "=================================================="
+  printf "Server:          %s\n" "$(server_ip)"
+  printf "Kernel:          %s\n" "$kernel"
+  printf "PPP device:      %b\n" "$ppp"
+  printf "strongswan:      %b\n" "$(svc strongswan-starter)"
+  printf "xl2tpd:          %b\n" "$(svc xl2tpd)"
+  printf "l2tp-firewall:   %b\n" "$(svc l2tp-firewall)"
+  echo "--------------------------------------------------"
+  if command -v ss >/dev/null 2>&1; then
+    local udp=""
+    udp="$(ss -uln 2>/dev/null | grep -E ':(500|4500|1701) ' || true)"
+    if [ -n "$udp" ]; then
+      printf '%s\n' "$udp" | sed 's/^/UDP listen:      /'
+    else
+      echo "UDP listen:      (no 500/4500/1701 found)"
+    fi
+  fi
+  echo "--------------------------------------------------"
+  printf "Users:           %s total, %s online\n" "$users" "$online"
+  printf "Total traffic:   upload %s, download %s\n" "$(human "$rx")" "$(human "$tx")"
+  echo "=================================================="
+}
+
+show_users() {
+  local u sess rx tx status
+  echo "=================================================="
+  printf "%-16s %-9s %-12s %-12s %-12s\n" "USERNAME" "STATUS" "UPLOAD" "DOWNLOAD" "TOTAL"
+  echo "--------------------------------------------------"
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    if [ -n "$(user_sessions "$u")" ]; then status="ONLINE"; else status="offline"; fi
+    read -r rx tx <<EOF
+$(user_totals "$u")
+EOF
+    printf "%-16s %-9s %-12s %-12s %-12s\n" "$u" "$status" "$(human "$rx")" "$(human "$tx")" "$(human $((rx + tx)))"
+  done <<EOF
+$(list_users)
+EOF
+  echo "=================================================="
+  echo "(Passwords are NOT shown here. Use 'card <user>' for one user's card.)"
+}
+
+show_live() {
+  local f u peer
+  echo "=================================================="
+  echo "  Live sessions"
+  echo "=================================================="
+  if [ ! -d "$SESSIONS_DIR" ] || [ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]; then
+    echo "No live sessions."
+    echo "=================================================="
+    return 0
+  fi
+  printf "%-18s %-16s %-18s\n" "SESSION" "USER" "PEER / IP"
+  echo "--------------------------------------------------"
+  for f in "$SESSIONS_DIR"/*; do
+    [ -f "$f" ] || continue
+    read -r u peer < "$f" 2>/dev/null || continue
+    printf "%-18s %-16s %-18s\n" "$(basename "$f")" "$(printf '%s' "$u" | tr -d '"')" "${peer:-}"
+  done
+  echo "=================================================="
+}
+
+show_stats() {
+  if [ -x "$L2TP_USER" ]; then
+    "$L2TP_USER" stats
+  else
+    echo "l2tp-user not found at $L2TP_USER — showing totals only:"
+    show_users
+  fi
+}
+
+show_logs() {
+  if [ -x "$L2TP_USER" ]; then
+    "$L2TP_USER" logs
+  elif [ -f "$SESSIONS_LOG" ]; then
+    tail -n 50 "$SESSIONS_LOG"
+  else
+    echo "No session log found at $SESSIONS_LOG"
+  fi
+}
+
+require_l2tp_user() {
+  if [ ! -x "$L2TP_USER" ]; then
+    echo "ERROR: $L2TP_USER not found or not executable."
+    echo "Run the Gemini VPN script first, then retry."
+    return 1
+  fi
+  return 0
+}
+
+# Sets SELECTED_USER from a numbered list, or returns 1.
+pick_user() {
+  local i=0 u choice
+  echo "Users:"
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    i=$((i + 1))
+    printf "  %s) %s\n" "$i" "$u"
+    eval "PICK_$i=\$u"
+  done <<EOF
+$(list_users)
+EOF
+  if [ "$i" -eq 0 ]; then echo "No users yet."; return 1; fi
+  printf "Select a user number: "
+  read -r choice
+  case "$choice" in
+    ''|*[!0-9]*) echo "Invalid choice."; return 1 ;;
+  esac
+  if [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then echo "Out of range."; return 1; fi
+  eval "SELECTED_USER=\$PICK_$choice"
+  return 0
+}
+
+do_add() {
+  local user="$1" pass="$2"
+  require_l2tp_user || return 1
+  if [ -n "$(user_pass "$user")" ]; then
+    echo "User '$user' already exists. Delete it first, or pick another name."
+    return 1
+  fi
+  "$L2TP_USER" add "$user" "$pass"
+}
+
+do_del() {
+  local user="$1"
+  require_l2tp_user || return 1
+  printf "Delete user '%s'? This cannot be undone. Type YES to confirm: " "$user"
+  read -r ans
+  if [ "$ans" != "YES" ]; then echo "Cancelled."; return 0; fi
+  "$L2TP_USER" del "$user"
+}
+
+show_card() {
+  local user="$1" pass mp tp
+  pass="$(user_pass "$user")"
+  if [ -z "$pass" ]; then echo "User '$user' not found in $CHAP"; return 1; fi
+  mp="$(master_psk)"; tp="$(tun_pass)"
+  echo "=========================================="
+  echo "  Card for: $user"
+  echo "  (Share ONLY with this user — it contains secrets.)"
+  echo "=========================================="
+  printf "Server IP:                %s\n" "$(server_ip)"
+  printf "Username:                 %s\n" "$user"
+  printf "Password:                 %s\n" "$pass"
+  echo "------------------------------------------"
+  echo "Modem — plain L2TP (no IPsec):"
+  printf "  LNS address:            %s\n" "$(server_ip)"
+  echo "  Hostname:                 modem"
+  printf "  Tunnel password:        %s\n" "$tp"
+  printf "  PPP username:           %s\n" "$user"
+  printf "  PPP password:           %s\n" "$pass"
+  echo "  Authentication:           Auto"
+  echo "------------------------------------------"
+  echo "Phone — L2TP/IPsec (TunnelForge, iPhone L2TP):"
+  printf "  Server:                 %s\n" "$(server_ip)"
+  printf "  PPP username:           %s\n" "$user"
+  printf "  PPP password:           %s\n" "$pass"
+  printf "  IPsec PSK (shared):     %s\n" "$mp"
+  echo "  L2TP secret:              (blank)"
+  echo "------------------------------------------"
+  echo "Phone — IKEv2/IPsec PSK (Android built-in):"
+  printf "  Server:                 %s\n" "$(server_ip)"
+  printf "  Identifier (ID):        %s\n" "$user"
+  printf "  PSK (per-user):         %s\n" "$pass"
+  echo "=========================================="
+}
+
+do_restart() {
+  echo "Restarting strongswan-starter, xl2tpd, l2tp-firewall..."
+  systemctl restart strongswan-starter xl2tpd l2tp-firewall 2>&1
+  sleep 2
+  show_status
+}
+
+pause() {
+  printf "\nPress Enter to continue..."
+  read -r _dummy || true
+}
+
+usage() {
+  echo "Usage: ezl2tp [status|users|stats|live|logs|add|del|card|restart|help]"
+  echo "  No argument: interactive menu."
+  echo "  add <user> [password]   (empty password = random)"
+  echo "  del <user>   card <user>"
+}
+
+# --- non-interactive mode ---
+if [ "${1:-}" != "" ]; then
+  case "$1" in
+    status)  show_status ;;
+    users)   show_users ;;
+    stats)   show_stats ;;
+    live)    show_live ;;
+    logs)    show_logs ;;
+    restart) do_restart ;;
+    add)
+      if [ -z "${2:-}" ]; then echo "Usage: ezl2tp add <user> [password]"; exit 1; fi
+      p="${3:-}"; [ -z "$p" ] && p="$(openssl rand -hex 6 2>/dev/null || echo changeme)"
+      do_add "$2" "$p"
+      ;;
+    del)
+      if [ -z "${2:-}" ]; then echo "Usage: ezl2tp del <user>"; exit 1; fi
+      # Non-interactive delete still asks for YES, on purpose.
+      do_del "$2"
+      ;;
+    card)
+      if [ -z "${2:-}" ]; then echo "Usage: ezl2tp card <user>"; exit 1; fi
+      show_card "$2"
+      ;;
+    help|--help|-h) usage ;;
+    *) echo "Unknown command: $1"; usage; exit 1 ;;
+  esac
+  # Propagate the command's own exit code (e.g. card for a missing user).
+  exit $?
+fi
+
+# --- interactive menu ---
+if [ "$(id -u)" != "0" ]; then
+  echo "Run ezl2tp as root."
+  exit 1
+fi
+
+while true; do
+  clear 2>/dev/null || true
+  echo "=================================================="
+  echo "  VPN Panel — mehr23  (L2TP + IKEv2)"
+  echo "=================================================="
+  printf "Server: %s   Kernel: %s   Users: %s, %s online\n" \
+    "$(server_ip)" "$(uname -r 2>/dev/null || echo unknown)" "$(count_users)" "$(count_online)"
+  echo "--------------------------------------------------"
+  echo "  1) Status"
+  echo "  2) Users (online + usage)"
+  echo "  3) Bandwidth stats (l2tp-user stats)"
+  echo "  4) Live sessions"
+  echo "  5) Session logs"
+  echo "  6) Add user"
+  echo "  7) Delete user"
+  echo "  8) Show user card (for sharing)"
+  echo "  9) Restart VPN services"
+  echo "  0) Exit"
+  echo "--------------------------------------------------"
+  printf "Choice: "
+  read -r choice
+  case "$choice" in
+    1) show_status; pause ;;
+    2) show_users; pause ;;
+    3) show_stats; pause ;;
+    4) show_live; pause ;;
+    5) show_logs; pause ;;
+    6)
+      printf "New username: "; read -r nu
+      case "$nu" in
+        ''|*[[:space:]\"\'\`]* ) echo "Invalid username (no spaces or quotes)."; pause; continue ;;
+      esac
+      printf "Password (Enter = random): "; read -r np
+      # Note: read without -s on purpose — over SSH from a phone,
+      # a hidden prompt is easy to mistype with no feedback.
+      if [ -z "$np" ]; then np="$(openssl rand -hex 6 2>/dev/null || echo changeme)"; fi
+      do_add "$nu" "$np"; pause
+      ;;
+    7)
+      if pick_user; then do_del "$SELECTED_USER"; fi
+      pause
+      ;;
+    8)
+      if pick_user; then show_card "$SELECTED_USER"; fi
+      pause
+      ;;
+    9) do_restart; pause ;;
+    0) echo "Bye."; exit 0 ;;
+    *) echo "Invalid choice."; sleep 1 ;;
+  esac
+done

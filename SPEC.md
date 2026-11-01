@@ -1,6 +1,6 @@
 # VPN panel — repo plan for Claude (draft, not yet a repo)
 
-Goal: turn the working mehr23 L2TP + IKEv2 setup and the vpn-panel
+Goal: turn the working mehr23 L2TP + IKEv2 setup and the ezl2tp
 script into a clean, newbie-friendly project that can someday be
 published. Start PRIVATE. Publish only after the release checklist
 below is green.
@@ -10,7 +10,7 @@ below is green.
   strongswan-starter + /etc/ipsec.conf (L2TP/IPsec IKEv1 + IKEv2),
   xl2tpd, firewall/NAT, and usage tracking
   (/var/log/vpn-usage, /usr/local/bin/l2tp-user).
-- vpn-panel (Rio, 2026-11-01): bash TUI/CLI on top of l2tp-user,
+- ezl2tp (Rio, 2026-11-01): bash TUI/CLI on top of l2tp-user,
   chap-secrets, totals.db and /run/vpn-sessions. Syntax-checked and
   smoke-tested against fake data. It delegates add/del to l2tp-user
   and does not rewrite the installer configs.
@@ -20,7 +20,7 @@ below is green.
   (a Debian 13 VPS, root SSH, a public IPv4), one-command install,
   first user, modem / Android / iPhone setup, screenshots of the menu.
 - install.sh — cleaned installer (see PR 1).
-- vpn-panel — the panel script, installable to /usr/local/bin.
+- ezl2tp — the panel script, installable to /usr/local/bin.
 - l2tp-user — the existing user/stats CLI, kept compatible.
 - docs/
   - modem-l2tp.md (plain L2TP only, tunnel password, no PSK field)

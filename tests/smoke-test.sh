@@ -1,11 +1,11 @@
 #!/bin/bash
-# Fake-data smoke test for vpn-panel.
+# Fake-data smoke test for ezl2tp.
 # All values here are TEST-ONLY and fake. Do not use real credentials.
-# Usage: bash tests/smoke-test.sh [path-to-vpn-panel]
+# Usage: bash tests/smoke-test.sh [path-to-ezl2tp]
 # Exits non-zero if any check fails.
 set -u
 
-PANEL="${1:-./vpn-panel}"
+PANEL="${1:-./ezl2tp}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

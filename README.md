@@ -15,7 +15,7 @@ before using it for a real user, and before any public release.
 - An L2TP/IPsec server (IKEv1, for modems and phones that still use
   L2TP) plus an IKEv2 server (for modern phones with built-in
   IKEv2/IPsec PSK support), on a Debian 13 VPS.
-- A bash panel, `vpn-panel`, with an interactive menu and one-shot
+- A bash panel, `ezl2tp`, with an interactive menu and one-shot
   commands:
   - status (kernel, PPP device, services, ports, users online)
   - users (online/offline, upload/download/total)
@@ -60,7 +60,7 @@ What the installer does, in order:
 4. Backs up any existing configs to `/root/easyl2tp-backup-*`.
 5. Installs strongswan-starter (L2TP/IPsec IKEv1 + IKEv2),
    xl2tpd, firewall/NAT, usage tracking, `l2tp-user`, and
-   `vpn-panel` if it can find it.
+   `ezl2tp` if it can find it.
 6. Prints the server IP and the two secrets at the end, on the
    server terminal only. Save them — do not share them publicly.
 
@@ -70,7 +70,7 @@ secrets and preserves existing users in chap-secrets.
 ## Current files
 
 - `install.sh` — the one-line installer above.
-- `vpn-panel` — the panel script. Works on top of an already
+- `ezl2tp` — the panel script. Works on top of an already
   installed L2TP/IKEv2 server that uses:
   - `/etc/ppp/chap-secrets` for users
   - `/var/log/vpn-usage/totals.db` and `sessions.log` for usage
@@ -85,12 +85,12 @@ secrets and preserves existing users in chap-secrets.
 ## Using the panel on an existing server (advanced users only)
 
 ```bash
-cp vpn-panel /usr/local/bin/vpn-panel
-chmod +x /usr/local/bin/vpn-panel
-vpn-panel            # interactive menu, run as root
-vpn-panel status
-vpn-panel users
-vpn-panel card <username>
+cp ezl2tp /usr/local/bin/ezl2tp
+chmod +x /usr/local/bin/ezl2tp
+ezl2tp            # interactive menu, run as root
+ezl2tp status
+ezl2tp users
+ezl2tp card <username>
 ```
 
 Passwords are never shown in the users list — only on one user's

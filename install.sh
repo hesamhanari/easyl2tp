@@ -32,7 +32,7 @@
 # update their settings):
 #   TUNPW="..."       modem tunnel password (default: generated/reused)
 #   IPSEC_PSK="..."   shared IPsec PSK      (default: generated/reused)
-#   EASYL2TP_BRANCH="main"   branch to fetch vpn-panel from, if needed
+#   EASYL2TP_BRANCH="main"   branch to fetch ezl2tp from, if needed
 #
 # What it installs (same tested stack as the original):
 #   strongswan-starter + /etc/ipsec.conf:
@@ -42,7 +42,7 @@
 #   firewall/NAT via /usr/local/sbin/l2tp-fw.sh + l2tp-firewall.service
 #   usage tracking: /var/log/vpn-usage/*, /usr/local/sbin/vpn-acct-update
 #   admin CLI: /usr/local/bin/l2tp-user
-#   panel: /usr/local/bin/vpn-panel (if it can be found next to
+#   panel: /usr/local/bin/ezl2tp (if it can be found next to
 #     this script or fetched from the repo; non-fatal if missing)
 #
 # This installer does NOT offer PPTP. PPTP encryption is broken.
@@ -771,21 +771,24 @@ USER_SCRIPT
 chmod +x /usr/local/bin/l2tp-user
 
 # --- Panel: copy from next to this script if present, else try the repo ---
+# The panel command was renamed from vpn-panel to ezl2tp.
+# Remove the old name so a server does not end up with two commands.
+rm -f /usr/local/bin/vpn-panel 2>/dev/null || true
 PANEL_INSTALLED=0
-if [ -f "./vpn-panel" ]; then
-  cp ./vpn-panel /usr/local/bin/vpn-panel 2>/dev/null || true
-  chmod +x /usr/local/bin/vpn-panel 2>/dev/null || true
+if [ -f "./ezl2tp" ]; then
+  cp ./ezl2tp /usr/local/bin/ezl2tp 2>/dev/null || true
+  chmod +x /usr/local/bin/ezl2tp 2>/dev/null || true
   PANEL_INSTALLED=1
 else
   BRANCH="${EASYL2TP_BRANCH:-main}"
-  if curl -fsSL --max-time 15 "https://raw.githubusercontent.com/hesamhanari/easyl2tp/${BRANCH}/vpn-panel" -o /usr/local/bin/vpn-panel 2>/dev/null; then
-    chmod +x /usr/local/bin/vpn-panel 2>/dev/null || true
+  if curl -fsSL --max-time 15 "https://raw.githubusercontent.com/hesamhanari/easyl2tp/${BRANCH}/ezl2tp" -o /usr/local/bin/ezl2tp 2>/dev/null; then
+    chmod +x /usr/local/bin/ezl2tp 2>/dev/null || true
     PANEL_INSTALLED=1
   fi
 fi
 if [ "$PANEL_INSTALLED" != "1" ]; then
-  echo "NOTE: vpn-panel could not be installed automatically (repo is private or panel file was not next to install.sh)."
-  echo "Install it later with: cp vpn-panel /usr/local/bin/vpn-panel && chmod +x /usr/local/bin/vpn-panel"
+  echo "NOTE: ezl2tp could not be installed automatically (repo is private or panel file was not next to install.sh)."
+  echo "Install it later with: cp ezl2tp /usr/local/bin/ezl2tp && chmod +x /usr/local/bin/ezl2tp"
 fi
 
 systemctl daemon-reload
@@ -811,6 +814,6 @@ echo "Do not share them publicly. Share a user card"
 echo "only with that user."
 echo "--------------------------------------------------"
 echo "Add a user:   l2tp-user add <username>"
-echo "Panel:        vpn-panel"
+echo "Panel:        ezl2tp"
 echo "Usage:        l2tp-user"
 echo "=================================================="
